@@ -1,0 +1,187 @@
+# EuroSAT land-cover classifier (Random Forest)
+
+Classifies Sentinel-2 multispectral image patches from the
+[EuroSAT dataset](https://zenodo.org/records/7711810) into 10 land-cover classes
+(AnnualCrop, Forest, HerbaceousVegetation, Highway, Industrial, Pasture, PermanentCrop,
+Residential, River, SeaLake) with a scikit-learn Random Forest, and serves predictions
+through a small local web page.
+
+The project compares several classification approaches. Both use the same 73 features
+(mean, standard deviation and 10th/50th/90th percentiles of every band, plus mean and spread of
+four spectral indices: NDVI, NDWI, NDBI, NDMI), computed over different areas:
+
+| Approach | What is classified | Results on 30% of the data |
+|---|---|---|
+| 1. Whole image | each 64×64 px image | 89.1% test accuracy |
+| 2. Sliding windows | each 16×16 px window, every 8 px (7×7 = 49 windows per image) | 79.5% of windows correct; 91.1% of images correct when their windows' probabilities are averaged |
+
+Window labels are inherited from their image (EuroSAT has no per-pixel labels), so a field
+window inside a "Highway" image counts as an error. The real window accuracy is higher than
+79.5%.
+
+## Project files
+
+| File | What it does |
+|---|---|
+| `prepare.py` | Reads every image, computes the features, writes `features.csv` and prints a dataset description |
+| `grid_search.py` | 5-fold grid search of Random Forest hyperparameters, writes `cv_results.csv` |
+| `train_final.py` | Trains the final model with the best hyperparameters, prints the results, saves `final_results.png` (loss curve + confusion matrix) and `models/model.joblib` |
+| `prepare_windows.py` | Approach 2: cuts images into 16×16 px windows (8 px step), computes their features, writes `window_features.csv` |
+| `grid_search_windows.py` | Approach 2: 5-fold grid search grouped by image, writes `cv_results_windows.csv` |
+| `train_windows.py` | Approach 2: trains the final window model with the best hyperparameters, prints the results, saves `models/window_model.joblib` |
+| `app.py` | Local web app. **Classify**: upload an image, see the whole-image prediction and the window map. **Train & validate**: train or cross-validate new models from the browser |
+| `trainer.py` | Background training/validation job used by the Train & validate page; saves models to `models/` |
+| `test_pipeline.py` | Quick end-to-end check of all the steps on 30% of the data; data and plots in `test_out/`, models as `models/test_model.joblib` and `models/test_window_model.joblib` |
+| `pyproject.toml`, `uv.lock`, `.python-version` | Python version and exact package versions for uv |
+| `models/model.joblib`, `models/window_model.joblib` | The two trained models included in the repo (see below) |
+
+## Included models
+
+The repo ships two trained models, so the web app works right after setup without any training:
+
+| File | Approach | Trained on | Hyperparameters | Test results |
+|---|---|---|---|---|
+| `models/model.joblib` | Whole image | 30% of EuroSAT (6,480 train / 1,620 test images) | 200 trees, `max_features=sqrt` (best of a 50/100/200-tree grid search) | 89.1% accuracy, macro-F1 0.885 |
+| `models/window_model.joblib` | 16×16 px windows | Same 30% split (25,920 train / 79,380 test windows) | 200 trees, `max_features=sqrt`, `min_samples_leaf=2` (fixed, not grid-searched) | 79.5% of windows, 91.1% of images (averaged windows) |
+
+They were trained with the package versions in `uv.lock`, which `uv sync` installs. A model file
+only loads with the scikit-learn version it was trained with.
+
+Running `train_final.py` or `train_windows.py` **replaces** these files with your own models, and
+`git` will then show them as changed. To keep the shipped ones, give your models other names, for
+example on the training page, or restore them with
+`git checkout -- models/model.joblib models/window_model.joblib`.
+
+The dataset itself is **not** in the repo. You need it to train models, and you need at least
+some 13-band `.tif` images from it to try the classifier.
+
+## Setup
+
+1. **Install uv** (it also installs the right Python version for you):
+
+   Windows (PowerShell):
+   ```powershell
+   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+   ```
+   macOS / Linux:
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   ```
+
+2. **Create the environment** from the project folder. This installs Python 3.12 if needed
+   and the exact package versions in `uv.lock` into `.venv/`:
+   ```
+   uv sync
+   ```
+
+3. **Download the data.** Get `EuroSAT_MS.zip` (2 GB, multispectral version) from
+   <https://zenodo.org/records/7711810> and unzip it into `data/`, so the folders look like:
+   ```
+   data/EuroSAT_MS/AnnualCrop/AnnualCrop_1.tif
+   data/EuroSAT_MS/Forest/...
+   ...
+   ```
+   An extra level (`data/EuroSAT_MS/EuroSAT_MS/AnnualCrop/...`), which some unzip tools create,
+   also works. **The data can live anywhere:** type its folder on the web app's training page
+   and click **Save as default**. From then on, the app and all scripts use it when no folder is
+   given. The choice is stored in `config.toml` in the project folder, which is personal and
+   ignored by git. The RGB version (`EuroSAT_RGB.zip`) does **not** work: the model needs all 13 bands.
+
+## Usage
+
+Run the commands from the project folder: `uv run` then picks the project environment
+automatically, so there is nothing to activate. All default paths (data, outputs, `models/`) are
+relative to the project folder, not to where you run from, and no path is tied to a particular
+computer. From another folder, use `uv run --project <project folder> <project folder>/prepare.py`.
+
+If something is missing, the scripts say what to do: no data → where to unzip it; no
+`features.csv` etc. → which step to run first. The web app starts with an empty `models/` folder,
+which is the case right after cloning, and asks you to train a model.
+
+**Quick check** that everything works, both approaches included (about 8 minutes, 30% of the data):
+```
+uv run test_pipeline.py
+```
+
+**Full pipeline:**
+```
+uv run prepare.py
+uv run grid_search.py
+uv run train_final.py
+```
+`prepare.py` takes about 15 minutes for the full dataset (mostly disk reads), `grid_search.py`
+roughly 15–30 minutes on 8 cores, `train_final.py` a minute or two.
+
+**Window model (approach 2)**, same three steps:
+```
+uv run prepare_windows.py
+uv run grid_search_windows.py
+uv run train_windows.py
+```
+- `prepare_windows.py` reads the images again (about 15 minutes for the full dataset). It
+  splits images into train and test exactly like approach 1, keeps 4 random windows per training
+  image and all 49 windows per test image. To use a share of the data:
+  `uv run prepare_windows.py data/EuroSAT_MS 0.3`.
+- Both prepare scripts read the default dataset folder (the one saved in the web app, else
+  `data/EuroSAT_MS`); give another folder as the first argument to override it for one run.
+- `grid_search_windows.py` searches `n_estimators`, `max_depth` and `min_samples_leaf`
+  (12 combinations) with 5-fold cross-validation on the training windows. Folds are grouped by
+  image, because the windows of one image overlap and would otherwise leak between folds.
+- `train_windows.py` trains the best model on all training windows and evaluates it on the
+  test windows, both per window and per image (averaging each image's windows).
+
+**Web interface:**
+```
+uv run app.py
+```
+Then open <http://127.0.0.1:5000> and upload a `.tif` from `data/EuroSAT_MS`. The top of the
+page shows the whole-image prediction. Below it is the window map: each coloured square is one
+window's class (hover for its confidence), with window counts per class and the averaged
+prediction.
+
+The app loads the included `models/model.joblib` and `models/window_model.joblib` by default. If
+a model is missing, its section shows how to train one. To start with other models, give their
+names (files in `models/`), for example the quick-check models:
+```
+uv run app.py test_model test_window_model
+```
+Stop it with Ctrl+C.
+
+**Train & validate page** (<http://127.0.0.1:5000/train>): trains models from the browser.
+- **Approach:** whole image or windows.
+- **Mode:**
+  - *Train only:* one value per hyperparameter.
+  - *Validate only:* comma-separated values; every combination is cross-validated (up to 100).
+  - *Validate, then train the best.*
+- **Data used (%):** share of the images in each class to use.
+- **Test share (%):** how much of that data is held out for testing (5–50%); the rest is used
+  for training and cross-validation.
+- **Hyperparameters:** `n_estimators`, `max_depth`, `max_features`, `min_samples_split`,
+  `min_samples_leaf`, plus the number of cross-validation folds.
+
+- **Model name** (when training): shown in the Classify page and used as the file name
+  `models/<name>.joblib`. It defaults to the approach plus date and time. An existing file is
+  never overwritten: the page asks for another name.
+
+The page shows each stage's progress, a live log, the validation ranking and the trained model's
+test scores. **Use in classifier** loads the new model into the Classify page.
+
+**Choosing models on the Classify page:** the *Models* card at the top has one list for
+whole-image models and one for window models. It lists every model in `models/`. Picking one loads it immediately. The name of the model in use is shown in each
+section heading and parameter table. The choice lasts until the app restarts. Features
+from the last run are kept in memory, so a second run with the same data settings skips
+reading the images.
+
+**Default dataset folder:** the training page's *Dataset folder* field starts with the default.
+That is `data/EuroSAT_MS` until you type another folder and click **Save as default**. The
+folder is checked for images before it is saved, and the scripts use the same default.
+
+## Notes
+
+- **All models are saved in `models/` only**, by the scripts and by the web app. Where a script
+  takes a model file name, any folder in it is ignored.
+- A model file only loads with the scikit-learn version it was trained with. If you change
+  package versions, re-run `train_final.py`.
+- Train and test sets are split once (80/20, stratified, seed 42) and shared by
+  `grid_search.py` and `train_final.py`, so test images are never used for tuning.
+- Ordinary RGB photos cannot be classified; only 13-band EuroSAT_MS GeoTIFFs are accepted.

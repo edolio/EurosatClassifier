@@ -1,0 +1,22 @@
+# Environment
+.venv/
+__pycache__/
+
+# Dataset: never in the repo (download it, see README)
+data/
+*.tif
+*.tiff
+*.zip
+
+# Generated outputs
+*.csv
+*.png
+test_out/
+
+# Models: only the two released ones are committed
+*.joblib
+!models/model.joblib
+!models/window_model.joblib
+
+# Personal settings saved by the web app (default dataset folder)
+config.toml
