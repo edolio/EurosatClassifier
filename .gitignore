@@ -13,10 +13,11 @@ data/
 *.png
 test_out/
 
-# Models: only the two released ones are committed
+# Models: only the three released ones are committed
 *.joblib
 !models/model.joblib
 !models/window_model.joblib
+!models/labelled_window_model.joblib
 
 # Personal settings saved by the web app (default dataset folder)
 config.toml

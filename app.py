@@ -25,12 +25,15 @@ from PIL import Image
 
 import trainer
 from prepare import B, BANDS, data_root, features, features_batch, find_root, model_file, save_data_root
+from train_labelled import window_X
 from prepare_windows import windows
 
 
 MODELS_DIR = trainer.MODELS_DIR.resolve()  # the only place models are read from and saved to
 MODEL_PATH = model_file(sys.argv[1] if len(sys.argv) > 1 else "model").resolve()
-WINDOW_PATH = model_file(sys.argv[2] if len(sys.argv) > 2 else "window_model").resolve()
+WINDOW_PATH = model_file(sys.argv[2] if len(sys.argv) > 2 else "labelled_window_model").resolve()
+if len(sys.argv) <= 2 and not WINDOW_PATH.exists():  # not labelled yet (fresh clone): the released window model
+    WINDOW_PATH = model_file("window_model").resolve()
 ACTIVE = {"image": None, "window": None}  # path of the model in use, per approach
 _meta = {}  # path -> (mtime, info), so each file is unpickled once to read its name and kind
 
@@ -155,7 +158,10 @@ def window_result(img):
     w = windows(img, size, step)
     rows, cols = w.shape[:2]
     wm = wbundle["model"]
-    P = wm.predict_proba(features_batch(w.reshape(rows * cols, size * size, -1))[wbundle["features"]])
+    F = features_batch(w.reshape(rows * cols, size * size, -1))
+    # labelled_window_model also needs the distances to its saved k-means centroids
+    X = window_X(F, wbundle["scaler"], wbundle["kmeans"]) if "kmeans" in wbundle else F[wbundle["features"]]
+    P = wm.predict_proba(X)
     P = P.reshape(rows, cols, -1)
 
     k = size // step  # blocks per window side (2): each window covers k x k blocks
@@ -557,7 +563,7 @@ aria-label="Block row {{ c.row + 1 }}, column {{ c.col + 1 }}: {{ c.cls }}, {{ '
 <p class="small">{{ "%.1f"|format(b.metrics.test_accuracy*100) }}% test accuracy.</p>{% else %}<p class="muted small">Train one on <a href="/train">Train &amp; validate</a>.</p>{% endif %}</div>
 <div class="approach"><h3>2 · Windows <span>· {{ w.name if w else "no model loaded" }}</span></h3>
 {% if w %}<p class="muted small">{{ w.size }} × {{ w.size }} px windows every {{ w.step }} px, averaged into an {{ w.step }} px class map.</p>
-<p class="small">{{ "%.1f"|format(w.metrics.image_vote_accuracy*100) }}% of test tiles right when windows are averaged.</p>{% else %}<p class="muted small">Build one with the window scripts (see README).</p>{% endif %}</div>
+{% if w.metrics.get("image_vote_accuracy") is not none %}<p class="small">{{ "%.1f"|format(w.metrics.image_vote_accuracy*100) }}% of test tiles right when windows are averaged.</p>{% else %}<p class="small">{{ "%.1f"|format(w.metrics.window_accuracy*100) }}% of test windows right.</p>{% endif %}{% else %}<p class="muted small">Build one with the window scripts (see README).</p>{% endif %}</div>
 {% endif %}
 </section>
 </main>
@@ -582,7 +588,7 @@ aria-label="Block row {{ c.row + 1 }}, column {{ c.col + 1 }}: {{ c.cls }}, {{ '
 {% if w.metrics.get("cv_macro_f1") is not none %}<tr><td>cross-validation window macro-F1</td><td class="num">{{ "%.3f"|format(w.metrics.cv_macro_f1) }}</td></tr>{% endif %}
 <tr><td>test window accuracy</td><td class="num">{{ "%.1f"|format(w.metrics.window_accuracy*100) }}%</td></tr>
 <tr><td>test window macro-F1</td><td class="num">{{ "%.3f"|format(w.metrics.window_macro_f1) }}</td></tr>
-<tr><td>test tile accuracy, windows averaged</td><td class="num">{{ "%.1f"|format(w.metrics.image_vote_accuracy*100) }}%</td></tr>
+{% if w.metrics.get("window_log_loss") is not none %}<tr><td>test window log loss</td><td class="num">{{ "%.3f"|format(w.metrics.window_log_loss) }}</td></tr>{% endif %}{% if w.metrics.get("image_vote_accuracy") is not none %}<tr><td>test tile accuracy, windows averaged</td><td class="num">{{ "%.1f"|format(w.metrics.image_vote_accuracy*100) }}%</td></tr>{% endif %}
 <tr><td>trained</td><td class="num">{{ w.trained }}</td></tr></table>{% endif %}</div>
 <div><h2 class="caps">How it works</h2>
 <p>Data: <a href="https://zenodo.org/records/7711810">EuroSAT</a>, 27,000 Sentinel-2 tiles of 64 × 64 px at 10 m with all 13 spectral bands, from 34 European countries.</p>
