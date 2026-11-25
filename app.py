@@ -406,7 +406,7 @@ def label_status():
     q = st.get("question")
     if q and request.args.get("have") == str(q["id"]):  # the page already shows this window's images
         q = {k: v for k, v in q.items() if k not in ("tile", "crop")}
-    proof = labelling.OUT_CSV.with_suffix(".png")
+    proof = labelling.PROOF_PNG
     return jsonify({k: v for k, v in st.items() if k not in ("log", "question", "answer")} |
                    {"log": st.get("log", [])[-400:], "question": q,
                     "elapsed": labeller.elapsed() if st.get("running") else st.get("total"),
@@ -436,7 +436,7 @@ def label_stop():
 
 @app.get("/label/proof.png")
 def label_proof():
-    proof = labelling.OUT_CSV.with_suffix(".png")
+    proof = labelling.PROOF_PNG
     if not proof.exists():
         return "No proof figure yet.", 404
     return send_file(proof, mimetype="image/png", max_age=0)
@@ -1059,7 +1059,7 @@ async function poll() {
   const log = s.log || [];
   if (s.started) {
     $("stage").textContent = s.error ? s.error : q ? "Waiting for your answer." : s.running ? (log[log.length - 1] || "Starting") :
-      `Finished at ${s.finished}. Dataset saved to window_labels.csv.`;
+      `Finished at ${s.finished}. Dataset saved to window_labels.csv.gz (labels) and window_labels_features.csv.`;
     $("log").hidden = !log.length; $("log").textContent = log.join("\\n"); $("log").scrollTop = 1e9;
     $("elapsed").textContent = s.elapsed ? `Started at ${s.started} · ${s.running ? "elapsed" : "took"} ${s.elapsed}` : "";
   }

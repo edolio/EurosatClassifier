@@ -1,12 +1,12 @@
-"""Approach 2 (labelled windows), step 2: grid-search the labelled window Random Forest on window_labels.csv.
+"""Approach 2 (labelled windows), step 2: grid-search the labelled window Random Forest on window_labels.csv.gz.
 
-Input: window_labels.csv (train_labelled.py label: windows of training images, with final labels and
-features) and window_features.csv (its training windows give the saved scaler + k-means centroids).
+Input: window_labels.csv.gz and window_labels_features.csv (train_labelled.py label: windows of training
+images, their final labels and features) and window_features.csv (its training windows give the saved scaler + k-means centroids).
 Features: 73 scaled features + distance to each of the 40 centroids. Human labels weigh HUMAN_WEIGHT
 times more. The labelled images are split 80/20 by image; the search uses only the training 80%.
 Folds are grouped by image, as for the window model, and scored with macro-F1.
 
-Usage: python grid_search_labelled.py [window_labels.csv] [window_features.csv]
+Usage: python grid_search_labelled.py [window_labels.csv.gz] [window_features.csv]
 """
 import sys
 

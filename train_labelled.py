@@ -12,8 +12,9 @@ windows each) plus every image a human already labelled a window of, then:
 3. shows you the most critical windows (one per cluster): the window outlined on its image and
    enlarged. Type a class number in the terminal, m (mixed / unsure: the window is dropped), s (skip)
    or q (stop this round). Each answer is appended to human_labels.csv at once, so nothing is lost on quit.
-   Outputs: human_labels.csv (your labels, read again on every run), window_labels.csv (the dataset:
-   final label, source and the 73 features of every window seen), window_labels.png (sample windows
+   Outputs: human_labels.csv (your labels, read again on every run), window_labels.csv.gz (the dataset:
+   final label and source of every window seen, ~1.4 MB), window_labels_features.csv (the 73 features
+   of the same windows, large and not in git), window_labels.png (sample windows
    per label, framed by where the label came from) and printed statistics.
 
 train: after grid_search_labelled.py, trains the final forest with the best params. Besides a window's
@@ -26,7 +27,7 @@ by image; test windows keep their cleaned labels and come from images the forest
 Saves labelled_results.png and models/labelled_window_model.joblib (the web app's window model).
 
 Usage: python train_labelled.py label [images per class, or all] [rounds] [window_features.csv]
-       python train_labelled.py train [window_labels.csv] [cv_results_labelled.csv] [window_features.csv]
+       python train_labelled.py train [window_labels.csv.gz] [cv_results_labelled.csv] [window_features.csv]
 """
 import ast
 import sys
@@ -58,7 +59,10 @@ FIT_PER_IMAGE = 8  # windows per image the labelling forests learn from (all win
 MIXED = "Mixed"
 WATER = ["River", "SeaLake"]
 BANK_WATER_P = 0.2  # below this water probability, a window in a River/SeaLake tile is relabelled as land
-HUMAN_CSV, OUT_CSV = PROJECT_DIR / "human_labels.csv", PROJECT_DIR / "window_labels.csv"
+HUMAN_CSV = PROJECT_DIR / "human_labels.csv"
+OUT_CSV = PROJECT_DIR / "window_labels.csv.gz"  # labels only, gzipped: ~1.4 MB, small enough for git
+PROOF_PNG = PROJECT_DIR / "window_labels.png"
+LABEL_COLS = ["file", "row", "col", "image_label", "label", "source", "confidence", "round"]
 FEATURES_CSV = PROJECT_DIR / "window_features.csv"  # from prepare_windows.py: k-means is fitted on its training windows
 KEY = ["file", "row", "col"]  # one window
 LOSS_SAMPLE = 20000  # windows per side used to draw the loss curve (scoring all at 25 sizes is slow)
@@ -395,6 +399,11 @@ def print_stats(out, human, checks):
     return stats
 
 
+def features_path(labels_csv):
+    """window_labels.csv.gz -> window_labels_features.csv: the 73 features of the same windows (large, not in git)."""
+    return Path(labels_csv).with_name(Path(labels_csv).name.split(".")[0] + "_features.csv")
+
+
 def label(per_class=PER_CLASS, rounds=ROUNDS, features_csv=FEATURES_CSV, ask=human_ask, human_csv=HUMAN_CSV,
          out_csv=OUT_CSV, root=None, on_stats=None):
     """on_stats(stats), if given, receives the final statistics as soon as they exist (the web app shows them)."""
@@ -418,21 +427,26 @@ def label(per_class=PER_CLASS, rounds=ROUNDS, features_csv=FEATURES_CSV, ask=hum
     stats = print_stats(out, read_human(human_csv), checks)
     if on_stats:
         on_stats(stats)
-    print(f"\nSaving the dataset ({len(out)} windows with features; about a minute per 100,000 windows)...")
-    out.to_csv(out_csv, index=False, float_format="%.6g")  # with features: the dataset 'train' reads
-    print(f"Saved {out_csv}")
+    feats_csv = features_path(out_csv)
+    print(f"\nSaving the dataset ({len(out)} windows; the features take about a minute per 100,000 windows)...")
+    out[LABEL_COLS].to_csv(out_csv, index=False)  # .gz in the name: pandas compresses
+    out[KEY + list(scaler.feature_names_in_)].to_csv(feats_csv, index=False, float_format="%.6g")
+    print(f"Saved {out_csv} (labels) and {feats_csv} (features)")
     print(f"Human labels: {len(read_human(human_csv))} in {human_csv}")
-    save_proof(out, root, Path(out_csv).with_suffix(".png"))
+    save_proof(out, root, Path(out_csv).with_name(Path(out_csv).name.split(".")[0] + ".png"))
     return out
 
 
 def load_labelled(labels_csv=OUT_CSV, features_csv=FEATURES_CSV, test_size=0.2, with_dropped=False):
     """Windows (not dropped, or all with with_dropped) with a train/test split column, forest input,
     labels, weights, scaler + k-means. Rows are sorted by image, row, col."""
-    df = pd.read_csv(labels_csv).sort_values(KEY).reset_index(drop=True)
+    df = pd.read_csv(labels_csv)
     scaler, km, _ = fit_kmeans(features_csv)  # same seed and data as 'label': same centroids
-    if not set(scaler.feature_names_in_) <= set(df.columns):
-        raise FileNotFoundError(f"{labels_csv} has no window features: rerun train_labelled.py label")
+    if not set(scaler.feature_names_in_) <= set(df.columns):  # labels and features are saved apart
+        df = df.merge(pd.read_csv(features_path(labels_csv)), on=KEY, how="left", validate="one_to_one")
+        if df[list(scaler.feature_names_in_)].isna().any().any():
+            raise FileNotFoundError(f"{features_path(labels_csv)} does not match {labels_csv}: rerun train_labelled.py label")
+    df = df.sort_values(KEY).reset_index(drop=True)
     # 80/20 split by image, stratified by image class, like the whole-image model: test windows keep
     # their cleaned labels and come from images the grid search and final forest never train on.
     files = df[df.source != "dropped"].groupby("file").image_label.first()

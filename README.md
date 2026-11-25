@@ -28,7 +28,7 @@ a "Highway" image is labelled Highway. Approach 2 fixes those labels before trai
 | `train_final.py` | Trains the final model with the best hyperparameters, prints the results, saves `final_results.png` (loss curve + confusion matrix) and `models/model.joblib` |
 | `prepare_windows.py` | Approach 2, step 1: cuts images into 16×16 px windows (8 px step), computes their features, writes `window_features.csv` (its training windows fit the k-means centroids) |
 | `grid_search_labelled.py` | Approach 2: 5-fold grid search grouped by image on the labelled windows, writes `cv_results_labelled.csv` |
-| `train_labelled.py` | Approach 2, two modes. `label`: builds the labelled window dataset (k-means distance features, forest relabelling, your labels for critical windows), writes `human_labels.csv` and `window_labels.csv`. `train`: trains the final labelled window model, prints per-window results, saves `labelled_results.png` and `models/labelled_window_model.joblib` |
+| `train_labelled.py` | Approach 2, two modes. `label`: builds the labelled window dataset (k-means distance features, forest relabelling, your labels for critical windows), writes `human_labels.csv`, `window_labels.csv.gz` (labels) and `window_labels_features.csv` (features). `train`: trains the final labelled window model, prints per-window results, saves `labelled_results.png` and `models/labelled_window_model.joblib` |
 | `app.py` | Local web app. **Classify**: upload an image, see the whole-image prediction and the window map. **Train & validate**: train or cross-validate whole-image models from the browser. **Label windows**: label windows for approach 2 |
 | `labeller.py` | Background labelling job used by the Label windows page: runs `train_labelled.py label` with the browser as labeller |
 | `trainer.py` | Background training/validation job used by the Train & validate page; saves models to `models/` |
@@ -151,7 +151,10 @@ never on test images, and reused in every round and for later predictions.
    matched yours.
 
 Your answers go to `human_labels.csv` straight away and are reused on every run; the final label
-and source (`image`, `auto`, `human`, `dropped`) and features of every window go to `window_labels.csv`, the labelled dataset. At the end, `window_labels.png`
+and source (`image`, `auto`, `human`, `dropped`) of every window go to `window_labels.csv.gz`, the
+labelled dataset (gzipped labels only, about 1.5 MB for 317,520 windows, small enough for git). Their
+73 features go to `window_labels_features.csv` (about 160 MB, ignored by git); `grid_search_labelled.py`
+and `train` read both. At the end, `window_labels.png`
 shows sample training windows for each label, framed by where the label came from (your label,
 relabelled by the forest, or the image label). Before that it prints statistics: windows used and dropped,
 per-class counts before and after relabelling, a table of label changes, and how your labels
