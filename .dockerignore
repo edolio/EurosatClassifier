@@ -1,0 +1,19 @@
+# Keep the image small and free of local or personal files
+.git
+.github
+.venv
+__pycache__
+.impeccable
+data/
+test_out/
+config.toml
+*.png
+*.tif
+*.tiff
+*.zip
+window_features.csv
+ProcessedData4Train/window_labels_features.csv
+# Local models: only the two shipped ones go in the image
+models/*
+!models/model.joblib
+!models/labelled_window_model.joblib

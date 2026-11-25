@@ -23,17 +23,19 @@ a "Highway" image is labelled Highway. Approach 2 fixes those labels before trai
 
 | File | What it does |
 |---|---|
-| `prepare.py` | Reads every image, computes the features, writes `features.csv` and prints a dataset description |
+| `prepare.py` | Reads every image, computes the features, writes `ProcessedData4Train/features.csv` and prints a dataset description |
 | `grid_search.py` | 5-fold grid search of Random Forest hyperparameters, writes `cv_results.csv` |
 | `train_final.py` | Trains the final model with the best hyperparameters, prints the results, saves `final_results.png` (loss curve + confusion matrix) and `models/model.joblib` |
 | `prepare_windows.py` | Approach 2, step 1: cuts images into 16×16 px windows (8 px step), computes their features, writes `window_features.csv` (its training windows fit the k-means centroids) |
 | `grid_search_labelled.py` | Approach 2: 5-fold grid search grouped by image on the labelled windows, writes `cv_results_labelled.csv` |
-| `train_labelled.py` | Approach 2, two modes. `label`: builds the labelled window dataset (k-means distance features, forest relabelling, your labels for critical windows), writes `human_labels.csv`, `window_labels.csv.gz` (labels) and `window_labels_features.csv` (features). `train`: trains the final labelled window model, prints per-window results, saves `labelled_results.png` and `models/labelled_window_model.joblib` |
+| `train_labelled.py` | Approach 2, two modes. `label`: builds the labelled window dataset (k-means distance features, forest relabelling, your labels for critical windows), writes `human_labels.csv`, `window_labels.csv.gz` (labels) and `window_labels_features.csv` (features) in `ProcessedData4Train/`. `train`: trains the final labelled window model, prints per-window results, saves `labelled_results.png` and `models/labelled_window_model.joblib` |
 | `app.py` | Local web app. **Classify**: upload an image, see the whole-image prediction and the window map. **Train & validate**: train or cross-validate whole-image models from the browser. **Label windows**: label windows for approach 2 |
 | `labeller.py` | Background labelling job used by the Label windows page: runs `train_labelled.py label` with the browser as labeller |
 | `trainer.py` | Background training/validation job used by the Train & validate page; saves models to `models/` |
 | `test_pipeline.py` | Quick end-to-end check of the whole-image steps on 30% of the data, plus the window features for approach 2; data and plots in `test_out/`, model as `models/test_model.joblib` |
 | `smoke_test.py` | Fast check without the dataset: starts the app, loads both models, classifies a fake image. Run by GitHub Actions (`.github/workflows/ci.yml`) on every pull request into `main` |
+| `ProcessedData4Train/` | Training data kept in git: whole-image features, window labels and your labels (see *Training data* below) |
+| `Dockerfile`, `.dockerignore`, `.github/workflows/docker.yml` | Docker image of the app, built on pull requests and published to GitHub Container Registry on every merge into `main` (see *Run with Docker*) |
 | `pyproject.toml`, `uv.lock`, `.python-version` | Python version and exact package versions for uv |
 | `models/model.joblib`, `models/labelled_window_model.joblib` | The two trained models included in the repo (see below) |
 
@@ -54,8 +56,53 @@ and `git` will then show them as changed. To keep the shipped ones, give your mo
 for example on the training page, or restore them with
 `git checkout -- models/model.joblib models/labelled_window_model.joblib`.
 
+## Training data (`ProcessedData4Train/`)
+
+The processed data needed to retrain the models is kept in git in `ProcessedData4Train/`, so you
+can retrain without recomputing it from the images. All three files describe the same 30% sample
+of EuroSAT (8,100 tiles; train/test split 80/20 by image, stratified, seed 42).
+
+| File | What it contains | Made by | Used by | For which model |
+|---|---|---|---|---|
+| `features.csv` | One row per tile (8,100 rows): file name, class, and the 73 features of the whole 64×64 tile (5 statistics per band + mean/spread of 4 indices). 5 MB. | `prepare.py` (or the quick check, as `test_out/features.csv`) | `grid_search.py`, `train_final.py` | **Whole image** (`models/model.joblib`) |
+| `window_labels.csv.gz` | One row per 16×16 window of the training tiles (317,520 rows): file, window row/column, the tile's class, the window's final label, where that label comes from (`image`, `auto` = relabelled by the forest, `human` = yours, `dropped`), the forest's confidence and the round. Gzipped, 1.5 MB. Labels only: no features. | `train_labelled.py label` (or the web app's **Label windows** page) | `grid_search_labelled.py`, `train_labelled.py train` | **Labelled windows** (`models/labelled_window_model.joblib`) |
+| `human_labels.csv` | Every window you labelled yourself: file, window row/column, the tile's class, your answer (a class or `Mixed`), the round and the time. 2 KB. The only file that cannot be recomputed. | your answers in `train_labelled.py label` or on the **Label windows** page, appended one at a time | `train_labelled.py label`: your labels override the tile labels, weigh 5× in training, and their tiles are always included in later rounds | **Labelled windows**, through `window_labels.csv.gz` |
+
+Two more files are needed for the labelled window model but are **not** in git, because they are
+large and can be rebuilt from the images:
+- `ProcessedData4Train/window_labels_features.csv` (about 160 MB): the 73 features of the windows
+  in `window_labels.csv.gz`, written next to it by `train_labelled.py label`.
+- `window_features.csv` (or `test_out/window_features.csv` for 30% of the data): written by
+  `prepare_windows.py`; its training windows fit the scaler and the 40 k-means centroids.
+
 The dataset itself is **not** in the repo. You need it to train models, and you need at least
 some 13-band `.tif` images from it to try the classifier.
+
+## Run with Docker (no Python setup)
+
+Every merge into `main` builds a Docker image with the app and both shipped models and publishes it
+to GitHub Container Registry. With [Docker](https://docs.docker.com/get-docker/) installed, one
+command starts the app:
+```
+docker run --rm -p 5000:5000 ghcr.io/edolio/eurosatclassifier:latest
+```
+Then open <http://localhost:5000> and upload a 13-band EuroSAT `.tif`. Stop it with Ctrl+C.
+
+The image holds no dataset. To train or label, mount the EuroSAT_MS folder at
+`/app/data/EuroSAT_MS` (the app's default dataset folder):
+```
+docker run --rm -p 5000:5000 -v "D:\path\to\EuroSAT_MS:/app/data/EuroSAT_MS" ghcr.io/edolio/eurosatclassifier:latest
+```
+Anything the container writes (new models, labels) disappears when it stops. To keep it, also mount
+your own copies of `models/` and `ProcessedData4Train/`, for example from a clone of this repo:
+`-v "${PWD}\models:/app/models" -v "${PWD}\ProcessedData4Train:/app/ProcessedData4Train"`.
+A mounted folder replaces the one in the image, so mount folders that already hold the models.
+
+How it is built: `Dockerfile` (Python 3.12 slim + the exact packages in `uv.lock`) and
+`.github/workflows/docker.yml`. Pull requests build the image and run `smoke_test.py` inside it;
+merges into `main` also push `:latest` and `:sha-<commit>`. The image is published as a private
+package the first time; to let anyone run it, set it to public once on GitHub: your profile →
+**Packages** → `eurosatclassifier` → **Package settings** → **Change visibility** → Public.
 
 ## Setup
 
@@ -151,8 +198,8 @@ never on test images, and reused in every round and for later predictions.
    `q` to stop the round. Before your answers are used, it prints how often the automatic label
    matched yours.
 
-Your answers go to `human_labels.csv` straight away and are reused on every run; the final label
-and source (`image`, `auto`, `human`, `dropped`) of every window go to `window_labels.csv.gz`, the
+Your answers go to `ProcessedData4Train/human_labels.csv` straight away and are reused on every run; the final label
+and source (`image`, `auto`, `human`, `dropped`) of every window go to `ProcessedData4Train/window_labels.csv.gz`, the
 labelled dataset (gzipped labels only, about 1.5 MB for 317,520 windows, small enough for git). Their
 73 features go to `window_labels_features.csv` (about 160 MB, ignored by git); `grid_search_labelled.py`
 and `train` read both. At the end, `window_labels.png`
@@ -197,7 +244,7 @@ as `train_labelled.py label`, with you answering in the browser instead of the t
 the images per class (`all` or a number), the rounds and the window features file, then press
 Start. Each question shows the tile with the window outlined and the window enlarged; answer with
 the class buttons or keys `0`–`9`, `m` (mixed / unsure), `s` (skip) or `q` (stop the round). Every
-answer goes straight to `human_labels.csv`. The log shows each message with the clock time and the
+answer goes straight to `ProcessedData4Train/human_labels.csv`. The log shows each message with the clock time and the
 time since the start. At the end the page shows the statistics as tables (totals, per class, a
 heat table of label changes, your labels) and the `window_labels.png` sample figure.
 

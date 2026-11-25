@@ -1,8 +1,8 @@
 """EuroSAT_MS -> one feature row per image, for a Random Forest.
 
 Usage: python prepare.py [EuroSAT_MS root, one subfolder per class] [out.csv]
-Defaults: the dataset folder saved as default in the web app (else data/EuroSAT_MS) and features.csv in the
-project folder, from any working directory.
+Defaults: the dataset folder saved as default in the web app (else data/EuroSAT_MS) and
+ProcessedData4Train/features.csv in the project folder, from any working directory.
 """
 import json
 import random
@@ -49,6 +49,7 @@ def save_data_root(folder):
 
 DATA_ROOT = data_root()  # read once per script run; the web app calls data_root() on every request
 MODELS_DIR = PROJECT_DIR / "models"  # every trained model is saved here
+PROCESSED_DIR = PROJECT_DIR / "ProcessedData4Train"  # training data kept in git: features and labels
 
 
 def model_file(name):
@@ -139,7 +140,8 @@ if __name__ == "__main__":
         df = load(sys.argv[1] if len(sys.argv) > 1 else DATA_ROOT)
     except FileNotFoundError as e:
         sys.exit(str(e))
-    out = sys.argv[2] if len(sys.argv) > 2 else PROJECT_DIR / "features.csv"
+    out = sys.argv[2] if len(sys.argv) > 2 else PROCESSED_DIR / "features.csv"
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out, index=False)
     describe(df)
     print(f"\nSaved {out}")

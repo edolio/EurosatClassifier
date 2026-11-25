@@ -9,9 +9,11 @@ data/
 *.zip
 
 # Generated outputs
-*.csv
 *.png
 test_out/
+# Window features: rebuilt by the scripts and over GitHub's 100 MB file limit
+window_features.csv
+ProcessedData4Train/window_labels_features.csv
 
 # Models: only the two released ones are committed
 *.joblib

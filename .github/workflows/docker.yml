@@ -1,0 +1,56 @@
+name: Docker image
+
+# Every merge into main publishes ghcr.io/<owner>/<repo>:latest (and :sha-<commit>).
+# Pull requests only build and smoke-test the image, so a broken Dockerfile is caught before merging.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write  # push to GitHub Container Registry with the built-in GITHUB_TOKEN
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image name (GHCR needs lower case)
+        id: name
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ steps.name.outputs.image }}:test
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test inside the image (app starts, models load, a fake tile is classified)
+        run: docker run --rm ${{ steps.name.outputs.image }}:test python smoke_test.py
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish latest and commit tags
+        if: github.event_name != 'pull_request'
+        run: |
+          img=${{ steps.name.outputs.image }}
+          docker tag "$img:test" "$img:latest"
+          docker tag "$img:test" "$img:sha-${GITHUB_SHA::7}"
+          docker push "$img:latest"
+          docker push "$img:sha-${GITHUB_SHA::7}"
