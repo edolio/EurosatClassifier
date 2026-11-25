@@ -1,6 +1,6 @@
 """Local web page: upload a EuroSAT_MS image (13-band GeoTIFF), get the predicted land-cover class.
 
-Two approaches on one page: the whole-image model (top) and the window model (below).
+Two approaches on one page: the whole-image model (top) and the labelled window model (below).
 
 A second page (/train) trains and validates new models in the background and shows the progress.
 
@@ -20,17 +20,22 @@ import joblib
 import numpy as np
 import pandas as pd
 import tifffile
-from flask import Flask, jsonify, redirect, render_template_string, request
+from flask import Flask, jsonify, redirect, render_template_string, request, send_file
 from PIL import Image
 
+import matplotlib
+matplotlib.use("Agg")  # labelling runs in a thread: its figures are saved, never shown
+
+import labeller
+import train_labelled as labelling
 import trainer
-from prepare import B, BANDS, data_root, features, features_batch, find_root, model_file, save_data_root
-from prepare_windows import windows
+from prepare import B, BANDS, PROJECT_DIR, data_root, features, features_batch, find_root, model_file, save_data_root
+from train_labelled import predict_windows
 
 
 MODELS_DIR = trainer.MODELS_DIR.resolve()  # the only place models are read from and saved to
 MODEL_PATH = model_file(sys.argv[1] if len(sys.argv) > 1 else "model").resolve()
-WINDOW_PATH = model_file(sys.argv[2] if len(sys.argv) > 2 else "window_model").resolve()
+WINDOW_PATH = model_file(sys.argv[2] if len(sys.argv) > 2 else "labelled_window_model").resolve()
 ACTIVE = {"image": None, "window": None}  # path of the model in use, per approach
 _meta = {}  # path -> (mtime, info), so each file is unpickled once to read its name and kind
 
@@ -81,6 +86,7 @@ COLORS = {  # map conventions: roads red, built-up pink, industry grey, water bl
     "Highway": "#e5564d", "Industrial": "#9aa4ae", "Pasture": "#cfdc7a",
     "PermanentCrop": "#ec8a4b", "Residential": "#e98bb5", "River": "#3fb8c8", "SeaLake": "#4d8de6",
 }
+MIXED_TOP, MIXED_SECOND = 0.6, 0.25  # a map block is split when its top class is under 60% and the runner-up at least 25%
 WATER = {"River", "SeaLake"}  # lettered in italic blue, as hydrography is on maps
 
 CLASSES = {
@@ -152,11 +158,9 @@ def window_result(img):
     H, W = img.shape[:2]
     if H < size or W < size:
         return {"error": f"Image is smaller than one {size}×{size} px window."}
-    w = windows(img, size, step)
-    rows, cols = w.shape[:2]
     wm = wbundle["model"]
-    P = wm.predict_proba(features_batch(w.reshape(rows * cols, size * size, -1))[wbundle["features"]])
-    P = P.reshape(rows, cols, -1)
+    _, P = predict_windows(wbundle, img)  # (rows, cols, classes): centroid distances + water around each window
+    rows, cols = P.shape[:2]
 
     k = size // step  # blocks per window side (2): each window covers k x k blocks
     total = np.zeros((rows + k - 1, cols + k - 1, P.shape[-1]))
@@ -166,14 +170,17 @@ def window_result(img):
             total[dy:dy + rows, dx:dx + cols] += P
             n[dy:dy + rows, dx:dx + cols] += 1
     B = total / n[..., None]  # (blocks_y, blocks_x, classes)
-    labels = wm.classes_[B.argmax(-1)]
-    conf = B.max(-1)
+    order = B.argsort(-1)
+    labels, labels2 = wm.classes_[order[..., -1]], wm.classes_[order[..., -2]]
+    conf, conf2 = np.take_along_axis(B, order[..., -1:], -1)[..., 0], np.take_along_axis(B, order[..., -2:-1], -1)[..., 0]
+    mixed = (conf < MIXED_TOP) & (conf2 >= MIXED_SECOND)  # two likely classes: drawn split along the diagonal
     cells = [{"cls": labels[r, c], "p": conf[r, c], "n": int(n[r, c]), "row": r, "col": c,
+              "cls2": labels2[r, c], "p2": conf2[r, c], "mixed": bool(mixed[r, c]),
               "top": r * step / H * 100, "left": c * step / W * 100,
               "h": step / H * 100, "w": step / W * 100}
              for r in range(labels.shape[0]) for c in range(labels.shape[1])]
     mean = P.reshape(-1, P.shape[-1]).mean(0)
-    return {"cells": cells, "rows": labels.shape[0], "cols": labels.shape[1], "n_windows": rows * cols,
+    return {"cells": cells, "n_mixed": int(mixed.sum()), "rows": labels.shape[0], "cols": labels.shape[1], "n_windows": rows * cols,
             "grid": labels.tolist(),
             "counts": list(pd.Series(labels.ravel()).value_counts().items()),
             "vote": wm.classes_[mean.argmax()], "vote_p": mean.max()}
@@ -190,7 +197,8 @@ def page(result=None, error=None, wres=None):
                                   classes=CLASSES, colors=COLORS, water=WATER, n_features=N_FEATURES,
                                   models=list_models(), active=ACTIVE, models_dir=MODELS_DIR,
                                   geo=result.get("geo") if result else None,
-                                  ticks=max(1, result["shape"][1] // step) if result else 8, scale=scale)
+                                  ticks=max(1, result["shape"][1] // step) if result else 8, scale=scale,
+                                  mixed_top=MIXED_TOP, mixed_second=MIXED_SECOND)
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -262,9 +270,8 @@ def number(form, name, lo, hi, label):
 def parse_form(form):
     """Validate the training form -> job config, or raise ValueError with a message for the user."""
     mode = form.get("mode")
-    approach = form.get("approach")
-    if mode not in ("train", "validate", "both") or approach not in ("image", "window"):
-        raise ValueError("Choose an approach and a mode.")
+    if mode not in ("train", "validate", "both"):
+        raise ValueError("Choose a mode.")
     try:
         root = find_root(form.get("root", "").strip() or data_root())
     except FileNotFoundError as e:
@@ -281,13 +288,13 @@ def parse_form(form):
         if mode == "train" and len(values) > 1:
             raise ValueError(f"{label}: train only needs exactly one value.")
         grid[name] = values
-    name = form.get("model_name", "").strip() or time.strftime(f"{approach}_model_%Y%m%d-%H%M%S")
+    name = form.get("model_name", "").strip() or time.strftime("image_model_%Y%m%d-%H%M%S")
     if not re.fullmatch(r"[A-Za-z0-9](?:[\w\-. ]{0,78}[\w\-])?", name):
         raise ValueError("Model name: up to 80 letters, digits, spaces, - _ . (start with a letter or digit).")
 
     if mode != "validate" and (MODELS_DIR / f"{name}.joblib").exists():
         raise ValueError(f"{name}.joblib already exists in models/; choose another name.")
-    return {"mode": mode, "approach": approach, "root": root, "grid": grid,
+    return {"mode": mode, "root": root, "grid": grid,
             "name": name,
             "frac": number(form, "data_pct", 1, 100, "Data share") / 100,
             "test_size": number(form, "test_pct", 5, 50, "Test share") / 100,
@@ -356,6 +363,85 @@ def models_select():
     return redirect("/")
 
 
+# --- Label page: human-in-the-loop window labelling (train_labelled.label) with the browser as labeller ---
+ANSWERS = set(CLASSES) | {"Mixed", "skip", "quit"}
+
+
+def default_features_csv():
+    """window_features.csv if built for the full data, else the 30% copy from the quick test."""
+    for f in (labelling.FEATURES_CSV, PROJECT_DIR / "test_out" / "window_features.csv"):
+        if f.exists():
+            return f
+    return labelling.FEATURES_CSV
+
+
+@app.route("/label")
+def label_page():
+    return render_template_string(LABEL_PAGE, page="label", features_csv=default_features_csv(),
+                                  n_human=len(labelling.read_human(labelling.HUMAN_CSV)), human_csv=labelling.HUMAN_CSV,
+                                  classes=list(CLASSES), colors=COLORS, water=WATER, project=PROJECT_DIR)
+
+
+@app.post("/label/start")
+def label_start():
+    f = request.form
+    per_class = f.get("per_class", "").strip().lower()
+    try:
+        if per_class != "all":
+            per_class = int(number(f, "per_class", 1, 3000, "Images per class"))
+        rounds = int(number(f, "rounds", 1, 10, "Rounds"))
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    csv = PROJECT_DIR / f.get("features_csv", "").strip()  # relative to the project; absolute stays absolute
+    if not csv.is_file():
+        return jsonify(error=f"No file at {csv}. Build it with prepare_windows.py (see README)."), 400
+    if not labeller.start(per_class, rounds, csv):
+        return jsonify(error="A labelling run is already in progress."), 409
+    return jsonify(ok=True)
+
+
+@app.get("/label/status")
+def label_status():
+    st = labeller.STATE
+    q = st.get("question")
+    if q and request.args.get("have") == str(q["id"]):  # the page already shows this window's images
+        q = {k: v for k, v in q.items() if k not in ("tile", "crop")}
+    proof = labelling.PROOF_PNG
+    return jsonify({k: v for k, v in st.items() if k not in ("log", "question", "answer")} |
+                   {"log": st.get("log", [])[-400:], "question": q,
+                    "elapsed": labeller.elapsed() if st.get("running") else st.get("total"),
+                    "n_human": len(labelling.read_human(labelling.HUMAN_CSV)),
+                    "proof": int(proof.stat().st_mtime) if st.get("finished") and proof.exists() else None})
+
+
+@app.post("/label/answer")
+def label_answer():
+    value = request.form.get("value", "")
+    if value not in ANSWERS:
+        return jsonify(error="Unknown answer."), 400
+    try:
+        qid = int(request.form.get("id", ""))
+    except ValueError:
+        return jsonify(error="Missing question id."), 400
+    if not labeller.answer(qid, value):
+        return jsonify(error="That window is no longer waiting for an answer."), 409
+    return jsonify(ok=True)
+
+
+@app.post("/label/stop")
+def label_stop():
+    labeller.stop()
+    return jsonify(ok=True)
+
+
+@app.get("/label/proof.png")
+def label_proof():
+    proof = labelling.PROOF_PNG
+    if not proof.exists():
+        return "No proof figure yet.", 404
+    return send_file(proof, mimetype="image/png", max_age=0)
+
+
 CSS = """<style>
 @font-face{font-family:Archivo;font-style:normal;font-weight:100 900;font-display:swap;src:url(/static/fonts/archivo-latin.woff2) format("woff2");unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
 @font-face{font-family:Archivo;font-style:normal;font-weight:100 900;font-display:swap;src:url(/static/fonts/archivo-latin-ext.woff2) format("woff2");unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+1E00-1E9F,U+2020,U+20A0-20AB,U+20AD-20C4,U+2113,U+2C60-2C7F,U+A720-A7FF}
@@ -408,7 +494,7 @@ td.num,th.num{text-align:right;padding-left:12px;white-space:nowrap}
 
 TOP = """<header class="top">
 <a class="mark" href="/">EuroSAT<span>/</span>land cover</a>
-<nav aria-label="Pages"><a href="/"{% if page == 'classify' %} aria-current="page"{% endif %}>Classify</a><a href="/train"{% if page == 'train' %} aria-current="page"{% endif %}>Train &amp; validate</a></nav>
+<nav aria-label="Pages"><a href="/"{% if page == 'classify' %} aria-current="page"{% endif %}>Classify</a><a href="/train"{% if page == 'train' %} aria-current="page"{% endif %}>Train &amp; validate</a><a href="/label"{% if page == 'label' %} aria-current="page"{% endif %}>Label windows</a></nav>
 {% if page == 'classify' %}<form method="post" action="/models/select" class="models" aria-label="Models in use">
 <label class="caps" for="m_image">Whole image</label>
 <select id="m_image" name="image" onchange="this.form.submit()">
@@ -498,9 +584,9 @@ summary::before{content:"";width:0;height:0;border:4px solid transparent;border-
 <div class="tile" id="tile">
 <img src="{{ result.preview }}" alt="True-colour preview of {{ result.name }}">
 {% for i in range(ticks + 1) %}{% set p = i * 100 / ticks %}<i class="tick x" style="left:{{ p }}%"></i><i class="tick x b" style="left:{{ p }}%"></i><i class="tick y" style="top:{{ p }}%"></i><i class="tick y r" style="top:{{ p }}%"></i>{% endfor %}
-{% if wres and not wres.error %}{% for c in wres.cells %}<div class="cell" data-cls="{{ c.cls }}" style="--i:{{ loop.index0 }};top:{{ c.top }}%;left:{{ c.left }}%;width:{{ c.w }}%;height:{{ c.h }}%;background:{{ colors.get(c.cls, '#888') }}" tabindex="0"
-data-tip="{{ c.cls }} · {{ '%.0f'|format(c.p*100) }}%&#10;block {{ c.row + 1 }}/{{ c.col + 1 }} · {{ c.n }} window{{ 's' if c.n != 1 }}"
-aria-label="Block row {{ c.row + 1 }}, column {{ c.col + 1 }}: {{ c.cls }}, {{ '%.0f'|format(c.p*100) }}% confidence"></div>{% endfor %}{% endif %}
+{% if wres and not wres.error %}{% for c in wres.cells %}<div class="cell" data-cls="{{ c.cls }}" style="--i:{{ loop.index0 }};top:{{ c.top }}%;left:{{ c.left }}%;width:{{ c.w }}%;height:{{ c.h }}%;background:{% if c.mixed %}linear-gradient(135deg,{{ colors.get(c.cls, '#888') }} 50%,{{ colors.get(c.cls2, '#888') }} 50%){% else %}{{ colors.get(c.cls, '#888') }}{% endif %}" tabindex="0"
+data-tip="{{ c.cls }} · {{ '%.0f'|format(c.p*100) }}%{% if c.mixed %} / {{ c.cls2 }} · {{ '%.0f'|format(c.p2*100) }}%{% endif %}&#10;block {{ c.row + 1 }}/{{ c.col + 1 }} · {{ c.n }} window{{ 's' if c.n != 1 }}"
+aria-label="Block row {{ c.row + 1 }}, column {{ c.col + 1 }}: {{ c.cls }}, {{ '%.0f'|format(c.p*100) }}% confidence{% if c.mixed %}, or {{ c.cls2 }}, {{ '%.0f'|format(c.p2*100) }}%{% endif %}"></div>{% endfor %}{% endif %}
 </div>
 <div class="scale" role="img" aria-label="Scale bar, {{ scale.total|int }} metres" style="--f:{{ scale.frac }}"><span class="bars"><i></i><i></i><i></i><i></i></span><span>0 · {{ scale.seg|int }} · {{ (scale.seg * 2)|int }} · {{ (scale.seg * 3)|int }} · {{ scale.total|int }} m</span></div>
 <svg class="north" viewBox="0 0 22 40" aria-hidden="true"><path d="M11 2 18 22 11 18 4 22Z" fill="currentColor"/><text x="11" y="36" text-anchor="middle" font-size="11" font-family="Archivo" fill="currentColor">N</text></svg>
@@ -534,8 +620,7 @@ aria-label="Block row {{ c.row + 1 }}, column {{ c.col + 1 }}: {{ c.cls }}, {{ '
 </div>
 <div class="answer">
 <h2 class="caps">2 · Windows{% if w %} · <span>{{ w.name }}</span>{% endif %}</h2>
-{% if not w %}<p class="muted">No window model loaded. Choose one above, or build one with <code>uv run prepare_windows.py</code>,
-<code>uv run grid_search_windows.py</code> and <code>uv run train_windows.py</code>.</p>
+{% if not w %}<p class="muted">No window model loaded. Choose one above, or build one with <code>train_labelled.py</code> (see README).</p>
 {% elif wres.error %}<p class="err" role="alert">{{ wres.error }}</p>
 {% else %}
 <p class="verdict{% if wres.vote in water %} water{% endif %}">{{ wres.vote }}</p>
@@ -543,6 +628,7 @@ aria-label="Block row {{ c.row + 1 }}, column {{ c.col + 1 }}: {{ c.cls }}, {{ '
 <table id="legend"><thead><tr><th>Class on the map</th><th class="num">Blocks</th></tr></thead><tbody>
 {% for c, n in wres.counts %}<tr data-cls="{{ c }}" tabindex="0"><td><span class="sw" style="background:{{ colors.get(c, '#888') }}"></span>{{ cname(c) }}</td><td class="num">{{ n }}</td></tr>{% endfor %}
 </tbody></table>
+{% if wres.n_mixed %}<p class="muted small" style="margin-top:8px"><span class="sw" style="background:linear-gradient(135deg,var(--collar) 50%,var(--rule) 50%)"></span>{{ wres.n_mixed }} split block{{ 's' if wres.n_mixed != 1 }}: two likely classes (top under {{ (mixed_top*100)|int }}%, runner-up {{ (mixed_second*100)|int }}% or more), counted under the top one. Hover for both.</p>{% endif %}
 <details><summary>Block grid as a table</summary><div style="overflow-x:auto">
 <table class="grid" style="width:auto;margin-top:8px">{% for r in wres.grid %}<tr>{% for c in r %}<td>{{ c }}</td>{% endfor %}</tr>{% endfor %}</table></div></details>
 {% endif %}
@@ -557,7 +643,7 @@ aria-label="Block row {{ c.row + 1 }}, column {{ c.col + 1 }}: {{ c.cls }}, {{ '
 <p class="small">{{ "%.1f"|format(b.metrics.test_accuracy*100) }}% test accuracy.</p>{% else %}<p class="muted small">Train one on <a href="/train">Train &amp; validate</a>.</p>{% endif %}</div>
 <div class="approach"><h3>2 · Windows <span>· {{ w.name if w else "no model loaded" }}</span></h3>
 {% if w %}<p class="muted small">{{ w.size }} × {{ w.size }} px windows every {{ w.step }} px, averaged into an {{ w.step }} px class map.</p>
-<p class="small">{{ "%.1f"|format(w.metrics.image_vote_accuracy*100) }}% of test tiles right when windows are averaged.</p>{% else %}<p class="muted small">Build one with the window scripts (see README).</p>{% endif %}</div>
+<p class="small">{{ "%.1f"|format(w.metrics.window_accuracy*100) }}% of test windows right.</p>{% else %}<p class="muted small">Build one with <code>train_labelled.py</code> (see README).</p>{% endif %}</div>
 {% endif %}
 </section>
 </main>
@@ -582,12 +668,12 @@ aria-label="Block row {{ c.row + 1 }}, column {{ c.col + 1 }}: {{ c.cls }}, {{ '
 {% if w.metrics.get("cv_macro_f1") is not none %}<tr><td>cross-validation window macro-F1</td><td class="num">{{ "%.3f"|format(w.metrics.cv_macro_f1) }}</td></tr>{% endif %}
 <tr><td>test window accuracy</td><td class="num">{{ "%.1f"|format(w.metrics.window_accuracy*100) }}%</td></tr>
 <tr><td>test window macro-F1</td><td class="num">{{ "%.3f"|format(w.metrics.window_macro_f1) }}</td></tr>
-<tr><td>test tile accuracy, windows averaged</td><td class="num">{{ "%.1f"|format(w.metrics.image_vote_accuracy*100) }}%</td></tr>
+{% if w.metrics.get("window_log_loss") is not none %}<tr><td>test window log loss</td><td class="num">{{ "%.3f"|format(w.metrics.window_log_loss) }}</td></tr>{% endif %}
 <tr><td>trained</td><td class="num">{{ w.trained }}</td></tr></table>{% endif %}</div>
 <div><h2 class="caps">How it works</h2>
 <p>Data: <a href="https://zenodo.org/records/7711810">EuroSAT</a>, 27,000 Sentinel-2 tiles of 64 × 64 px at 10 m with all 13 spectral bands, from 34 European countries.</p>
 <p>Each tile or window is summarised into {{ n_features }} numbers: mean, standard deviation and 10th, 50th and 90th percentile of every band, plus the mean and spread of NDVI, NDWI, NDBI and NDMI. A Random Forest votes on them.</p>
-<p>Window labels come from their tile, so window accuracy is pessimistic. Models are read from <code>models/</code>; train new ones on <a href="/train">Train &amp; validate</a>.</p></div>
+<p>Window labels start from their tile's label and are cleaned by the forest and by you on <a href="/label">Label windows</a>. Models are read from <code>models/</code>; train whole-image models on <a href="/train">Train &amp; validate</a>.</p></div>
 <div class="legend"><h2 class="caps">Legend</h2><dl>
 {% for c, d in classes.items() %}<div><dt><span class="sw" style="background:{{ colors.get(c, '#888') }}"></span>{{ cname(c) }}</dt><dd>{{ d }}</dd></div>{% endfor %}</dl></div>
 </section>
@@ -613,9 +699,7 @@ if (tile && legend) {
 </script>
 </body></html>"""
 
-TRAIN_PAGE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>EuroSAT land cover · Train &amp; validate</title>""" + CSS + """<style>
+JOB_CSS = """<style>
 .train{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,520px);align-items:start}
 .form{padding:36px 40px 48px;border-right:1px solid var(--rule)}
 .form h1{font:700 26px/1.15 var(--narrow);margin:4px 0 8px}.lede{color:var(--collar);max-width:62ch;margin-bottom:28px}
@@ -653,15 +737,16 @@ font:13px/1.55 ui-monospace,Consolas,monospace;color:#b9c8c0;white-space:pre-wra
 .used{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-top:14px}
 @media (max-width:1100px){.train{grid-template-columns:1fr}.form{border-right:0;border-bottom:1px solid var(--rule)}.status{position:static;max-height:none}}
 @media (max-width:760px){.top{padding:0 16px;gap:4px 24px}.form,.status{padding:28px 16px}.field{grid-template-columns:1fr}.hint{grid-column:1}}
-</style></head><body>
+</style>"""
+
+TRAIN_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EuroSAT land cover · Train &amp; validate</title>""" + CSS + """""" + JOB_CSS + """</head><body>
 """ + TOP + """
 <main class="train">
 <form id="f" class="form" novalidate>
 <h1>Train &amp; validate</h1>
-<p class="lede">Train or cross-validate Random Forest models in the background. Models are saved to <code>models/</code>; an existing model is never overwritten.</p>
-<fieldset><legend class="caps">Approach</legend>
-<div class="opts"><label><input type="radio" name="approach" value="image" checked>Whole image</label>
-<label><input type="radio" name="approach" value="window">Windows, 16 × 16 px every 8 px</label></div></fieldset>
+<p class="lede">Train or cross-validate whole-image Random Forest models in the background. Models are saved to <code>models/</code>; an existing model is never overwritten. The labelled window model is built with <code>train_labelled.py</code>.</p>
 <fieldset><legend class="caps">Mode</legend>
 <div class="opts"><label><input type="radio" name="mode" value="train">Train only</label>
 <label><input type="radio" name="mode" value="validate">Validate only</label>
@@ -683,8 +768,8 @@ font:13px/1.55 ui-monospace,Consolas,monospace;color:#b9c8c0;white-space:pre-wra
 <input type="text" id="{{ name }}" name="{{ name }}" value="{{ default }}" class="hp" spellcheck="false">
 <span class="hint">{{ allowed }}</span></div>{% endfor %}</fieldset>
 <fieldset class="trainonly"><legend class="caps">Output</legend>
-<div class="field"><label for="model_name">Model name</label><input type="text" id="model_name" name="model_name" maxlength="80" placeholder="e.g. windows_30pct_200trees" spellcheck="false">
-<span class="hint">Shown on the Classify page and used as the file name; empty = approach + date and time</span></div>
+<div class="field"><label for="model_name">Model name</label><input type="text" id="model_name" name="model_name" maxlength="80" placeholder="e.g. image_30pct_200trees" spellcheck="false">
+<span class="hint">Shown on the Classify page and used as the file name; empty = image_model + date and time</span></div>
 <div class="field"><span>Saved to</span><code style="justify-self:start;overflow-wrap:anywhere">{{ out_dir }}</code></div></fieldset>
 <div class="actions"><button type="submit" class="btn" id="go">Start</button><span id="cands"></span>
 <p class="err small" id="formerr" role="alert" style="flex-basis:100%"></p></div>
@@ -754,12 +839,9 @@ async function poll() {
   $("modelcard").hidden = !s.model;
   if (s.model) {
     const m = s.model.metrics, rows = [["Name", s.model.name],
-      ["Approach", s.model.approach === "image" ? "Whole image" : "Windows"],
       ...Object.entries(s.model.params).map(([k, v]) => [k, v === null ? "None" : v])];
     if (m.cv_macro_f1 != null) rows.push(["Cross-validation macro-F1", m.cv_macro_f1.toFixed(4)]);
-    if ("test_accuracy" in m) rows.push(["Test accuracy", pct(m.test_accuracy)], ["Test macro-F1", m.test_macro_f1.toFixed(4)]);
-    else rows.push(["Test window accuracy", pct(m.window_accuracy)], ["Test window macro-F1", m.window_macro_f1.toFixed(4)],
-                   ["Test tile accuracy, windows averaged", pct(m.image_vote_accuracy)]);
+    rows.push(["Test accuracy", pct(m.test_accuracy)], ["Test macro-F1", m.test_macro_f1.toFixed(4)]);
     rows.push(["Train / test rows", `${m.n_train} / ${m.n_test}`], ["Saved to", s.model.path]);
     $("mtable").replaceChildren(...rows.map(row));
     if (modelPath !== s.model.path) { modelPath = s.model.path; $("usemsg").textContent = ""; }
@@ -782,6 +864,216 @@ poll();
 </script>
 </body></html>"""
 
+
+
+LABEL_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>EuroSAT land cover · Label windows</title>""" + CSS + JOB_CSS + """<style>
+.btn[hidden]{display:none}
+.qhead{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+.qhead h2{font:700 22px/1.2 var(--narrow);overflow-wrap:anywhere}
+.qimgs{display:grid;grid-template-columns:repeat(2,minmax(0,320px));gap:18px;margin-bottom:14px}
+.qimgs figure{margin:0}.qimgs img{display:block;width:100%;aspect-ratio:1;image-rendering:pixelated;border:1px solid var(--rule)}
+.qimgs figcaption{color:var(--collar);font-size:var(--s-small);margin-top:6px}
+.tilebox{position:relative}
+#qrect{position:absolute;border:2px solid var(--alert);box-shadow:0 0 0 1px rgba(0,0,0,.6);pointer-events:none}
+.guess{color:var(--collar);font-size:var(--s-small);margin-bottom:14px}.guess b{color:var(--ink);font-weight:600}
+.choices{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:8px}
+.choice{display:flex;align-items:center;gap:10px;font:500 var(--s-body)/1.2 Archivo,sans-serif;color:var(--ink);text-align:left;
+background:var(--sheet);border:1px solid var(--rule);border-radius:4px;padding:10px 12px;cursor:pointer;transition:border-color .15s,background .15s}
+.choice:hover{border-color:var(--collar);background:var(--raise)}
+.choice.isguess{border-color:var(--purple)}
+.choice:disabled{opacity:.45;cursor:default}
+kbd{font:600 12px/1 ui-monospace,Consolas,monospace;color:var(--collar);border:1px solid var(--rule);border-radius:3px;padding:3px 6px;min-width:22px;text-align:center}
+.sw{display:inline-block;width:12px;height:12px;border-radius:2px;flex:none}
+.others{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.waiting{border:1px dashed var(--rule);border-radius:4px;padding:22px;color:var(--collar)}
+#proof{display:block;width:100%;border:1px solid var(--rule);border-radius:4px;margin-top:6px}
+#log{white-space:pre;overflow:auto}
+.train>*{min-width:0}  /* wide tables and log lines scroll inside their box, not the page */
+#statscard{margin-top:34px;padding-top:22px;border-top:1px solid var(--rule)}
+#statscard h3{font:700 18px/1.2 var(--narrow);margin:26px 0 4px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:12px}
+.kpi{background:var(--sheet);border:1px solid var(--rule);border-radius:4px;padding:12px 14px}
+.kpi b{display:block;font:700 26px/1.1 var(--narrow);color:var(--ink)}
+.kpi span{font-size:var(--s-small);color:var(--collar)}
+.tablewrap{overflow-x:auto;margin-top:10px}
+.tablewrap table{min-width:560px}.tablewrap th{white-space:nowrap}
+.tablewrap td:first-child{white-space:nowrap;padding-right:14px}
+#tchanges td.num{padding:6px 8px;min-width:44px}#tchanges td.zero{color:var(--rule)}
+#tchanges th.num{font-size:12px;letter-spacing:.04em}
+@media (max-width:760px){.qimgs{grid-template-columns:1fr 1fr;gap:10px}.choices{grid-template-columns:1fr 1fr}}
+</style></head><body>
+{% macro cname(c) %}{% if c in water %}<span class="water">{{ c }}</span>{% else %}{{ c }}{% endif %}{% endmacro %}
+""" + TOP + """
+<main class="train">
+<div class="form">
+<h1>Label windows</h1>
+<p class="lede">The labelling loop of <code>train_labelled.py label</code>, answered here. The forest relabels and drops windows
+on its own, then asks you about the windows it finds hardest. Every answer is saved at once to <code>human_labels.csv</code>.</p>
+
+<form id="f" novalidate>
+<fieldset><legend class="caps">Run</legend>
+<div class="field"><label for="per_class">Images per class</label><input type="text" id="per_class" name="per_class" value="all" spellcheck="false">
+<span class="hint"><code>all</code> = every training image (about 20 min of computing before the first question on 30% data), or a number such as 100</span></div>
+<div class="field"><label for="rounds">Rounds</label><input type="number" id="rounds" name="rounds" value="1" min="1" max="10">
+<span class="hint">Up to 30 windows to label per round</span></div>
+<div class="field"><label for="features_csv">Window features</label><input type="text" id="features_csv" name="features_csv" value="{{ features_csv }}" spellcheck="false">
+<span class="hint">From <code>prepare_windows.py</code>; its training windows fit the k-means centroids</span></div>
+<div class="field"><span>Your labels so far</span><span><b id="nhuman">{{ n_human }}</b> <span class="muted small">in {{ human_csv.name }}</span></span></div>
+</fieldset>
+<div class="actions"><button type="submit" class="btn" id="go">Start labelling</button>
+<button type="button" class="btn ghost" id="stopall" hidden>Stop asking</button>
+<p class="err small" id="formerr" role="alert" style="flex-basis:100%"></p></div>
+</form>
+
+<section id="wait" class="waiting" hidden aria-live="polite">The forest is preparing the next questions. This page updates by itself.</section>
+
+<section id="q" hidden aria-live="polite">
+<div class="qhead"><h2 id="qtitle"></h2><span class="caps" id="qn"></span></div>
+<div class="qimgs">
+<figure><div class="tilebox"><img id="qtile" alt="Tile with the window outlined in red"><div id="qrect"></div></div><figcaption id="qtilecap"></figcaption></figure>
+<figure><img id="qcrop" alt="The window, enlarged"><figcaption>The window, enlarged (16 × 16 px, 160 m across)</figcaption></figure>
+</div>
+<p class="guess" id="qguess"></p>
+<div class="choices" role="group" aria-label="What does the outlined window show?">
+{% for c in classes %}<button type="button" class="choice" data-v="{{ c }}"><kbd>{{ loop.index0 }}</kbd><span class="sw" style="background:{{ colors[c] }}"></span>{{ cname(c) }}</button>{% endfor %}
+</div>
+<div class="others">
+<button type="button" class="btn ghost sm choice2" data-v="Mixed"><kbd>m</kbd> Mixed / unsure</button>
+<button type="button" class="btn ghost sm choice2" data-v="skip"><kbd>s</kbd> Skip</button>
+<button type="button" class="btn ghost sm choice2" data-v="quit"><kbd>q</kbd> Stop this round</button>
+</div>
+<p class="err small" id="qerr" role="alert"></p>
+</section>
+
+<section id="statscard" hidden aria-label="Labelling statistics"><h2 class="caps">Labelling statistics</h2>
+<div class="kpis" id="kpis"></div>
+<h3>Per class</h3>
+<p class="muted small">Image windows: cut from tiles of this class. Moved away / in: label changed by the forest or by you. Final: windows used in training.</p>
+<div class="tablewrap"><table id="tclass"></table></div>
+<div id="changeswrap"><h3>Label changes</h3>
+<p class="muted small">Rows: the tile's class. Columns: the window's new label. Darker = more windows.</p>
+<div class="tablewrap"><table id="tchanges"></table></div></div>
+<div id="humanwrap"><h3>Your labels</h3><div id="thuman"></div></div>
+</section>
+</div>
+
+<aside class="status" aria-label="Labelling run">
+<section id="jobstate" data-state="idle" aria-live="polite"><h2 class="caps">Progress</h2>
+<p class="state"><span id="statelabel">Idle</span></p>
+<p id="stage">No labelling run since the app started.</p>
+<p id="elapsed" class="muted small"></p>
+<pre id="log" hidden></pre></section>
+<section id="proofcard" hidden><h2 class="caps">Windows used in training</h2>
+<p class="muted small">Sample windows per label; the frame shows where the label came from.</p>
+<img id="proof" alt="Sample labelled windows per class"></section>
+</aside>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const KEYS = {{ classes|tojson }}, COLORS = {{ colors|tojson }}, WATERS = {{ water|list|tojson }};
+let timer = null, qid = null, busy = false, statsKey = null;
+
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+const fmt = v => typeof v === "number" ? v.toLocaleString("en-US").replace(/,/g, "\\u2009") : v;
+function cname(c) {
+  const td = el("td"), sw = el("span", "sw"); sw.style.background = COLORS[c] || "#888"; sw.style.marginRight = "9px";
+  const t = el("span", WATERS.includes(c) ? "water" : "", c); td.append(sw, t); return td;
+}
+function fill(table, data, heat) {
+  const head = el("tr"); head.append(el("th", "", heat ? "Tile class" : "Class"));
+  data.columns.forEach(c => head.append(el("th", "num", c)));
+  const max = heat ? Math.max(1, ...data.rows.flatMap(r => r.slice(1))) : 0;
+  const rows = data.rows.map(r => { const tr = el("tr"); tr.append(cname(r[0]));
+    r.slice(1).forEach(v => { const td = el("td", "num" + (heat && !v ? " zero" : ""), fmt(v));
+      if (heat && v) td.style.background = `color-mix(in srgb, var(--purple) ${Math.round(12 + 58 * v / max)}%, transparent)`;
+      tr.append(td); }); return tr; });
+  const thead = el("thead"), tbody = el("tbody"); thead.append(head); tbody.append(...rows); table.replaceChildren(thead, tbody);
+}
+function renderStats(st) {
+  const k = [[st.seen, `windows from ${fmt(st.images)} tiles`], [st.used, `used in training (${(100 * st.used / st.seen).toFixed(1)}%)`],
+             [st.dropped, "dropped (unclear or mixed)"], [st.sources.auto || 0, "relabelled by the forest"],
+             [st.human ? st.human.total : 0, "labelled by you"]];
+  $("kpis").replaceChildren(...k.map(([n, t]) => { const d = el("div", "kpi"); d.append(el("b", "", fmt(n)), el("span", "", t)); return d; }));
+  fill($("tclass"), st.per_class, false);
+  $("changeswrap").hidden = !st.changes; if (st.changes) fill($("tchanges"), st.changes, true);
+  $("humanwrap").hidden = !st.human;
+  if (st.human) {
+    const h = st.human, box = $("thuman"); box.replaceChildren();
+    const p = el("p", "small");
+    p.textContent = `${h.total} windows: ${h.total - h.mixed} with a class, ${h.mixed} mixed or unsure. ` +
+      (h.agree_image == null ? "" : `Your class matched the tile's label on ${Math.round(100 * h.agree_image)}% of them.`);
+    box.append(p);
+    if (st.rounds.length) box.append(el("p", "small muted", st.rounds.map(([r, a, n]) =>
+      `Round ${r}: the automatic label matched yours on ${a} of ${n} windows (${Math.round(100 * a / n)}%).`).join(" ")));
+    const t = el("table"); t.style.marginTop = "10px";
+    fill(t, {columns: ["Windows you labelled", "Matched the tile's label"], rows: h.per_class.map(([c, m, n]) => [c, n, `${Math.round(100 * m)}%`])}, false);
+    t.querySelector("th").textContent = "Tile class"; box.append(t);
+  }
+}
+const LABEL = {idle: "Idle", running: "Running", asking: "Your turn", done: "Done", failed: "Failed"};
+
+$("f").addEventListener("submit", async e => {
+  e.preventDefault(); $("formerr").textContent = "";
+  const r = await fetch("/label/start", {method: "POST", body: new FormData($("f"))});
+  const j = await r.json();
+  if (!r.ok) { $("formerr").textContent = j.error; return; }
+  poll();
+});
+$("stopall").addEventListener("click", async () => { await fetch("/label/stop", {method: "POST"}); poll(); });
+
+async function send(v) {
+  if (busy || qid === null) return;
+  busy = true; document.querySelectorAll(".choice,.choice2").forEach(b => b.disabled = true);
+  const r = await fetch("/label/answer", {method: "POST", body: new URLSearchParams({id: qid, value: v})});
+  $("qerr").textContent = r.ok ? "" : (await r.json()).error;
+  busy = false; poll();
+}
+document.querySelectorAll(".choice,.choice2").forEach(b => b.addEventListener("click", () => send(b.dataset.v)));
+document.addEventListener("keydown", e => {
+  if ($("q").hidden || e.target.matches("input,textarea") || e.ctrlKey || e.metaKey || e.altKey) return;
+  const v = /^[0-9]$/.test(e.key) ? KEYS[+e.key] : {m: "Mixed", s: "skip", q: "quit"}[e.key.toLowerCase()];
+  if (v) { e.preventDefault(); send(v); }
+});
+
+function show(q) {
+  if (q.tile) { $("qtile").src = q.tile; $("qcrop").src = q.crop; }
+  const [x, y, w] = q.box, r = $("qrect").style;
+  r.left = x + "%"; r.top = y + "%"; r.width = w + "%"; r.height = w + "%";
+  $("qtitle").textContent = q.file; $("qn").textContent = `Window ${q.id}`;
+  $("qtilecap").textContent = `Tile labelled ${q.image_label} · window row ${q.row + 1}, column ${q.col + 1}`;
+  $("qguess").innerHTML = `The forest guesses <b>${q.guess}</b> (${Math.round(q.conf * 100)}%). Pick what the outlined window shows.`;
+  document.querySelectorAll(".choice").forEach(b => { b.classList.toggle("isguess", b.dataset.v === q.guess); b.disabled = false; });
+  document.querySelectorAll(".choice2").forEach(b => b.disabled = false);
+  if (qid !== q.id) { qid = q.id; $("q").scrollIntoView({block: "nearest"}); }
+}
+
+async function poll() {
+  clearTimeout(timer);
+  const s = await (await fetch("/label/status?have=" + (qid ?? ""))).json();
+  const q = s.question;
+  const state = s.error ? "failed" : q ? "asking" : s.running ? "running" : s.finished ? "done" : "idle";
+  $("jobstate").dataset.state = state === "asking" ? "running" : state; $("statelabel").textContent = LABEL[state];
+  $("go").disabled = !!s.running; $("stopall").hidden = !s.running; $("nhuman").textContent = s.n_human;
+  const log = s.log || [];
+  if (s.started) {
+    $("stage").textContent = s.error ? s.error : q ? "Waiting for your answer." : s.running ? (log[log.length - 1] || "Starting") :
+      `Finished at ${s.finished}. Dataset saved to window_labels.csv.gz (labels) and window_labels_features.csv.`;
+    $("log").hidden = !log.length; $("log").textContent = log.join("\\n"); $("log").scrollTop = 1e9;
+    $("elapsed").textContent = s.elapsed ? `Started at ${s.started} · ${s.running ? "elapsed" : "took"} ${s.elapsed}` : "";
+  }
+  $("q").hidden = !q; $("wait").hidden = !(s.running && !q);
+  if (q) show(q); else qid = null;
+  $("statscard").hidden = !s.stats;
+  if (s.stats && statsKey !== s.started + s.stats.seen) { statsKey = s.started + s.stats.seen; renderStats(s.stats); }
+  $("proofcard").hidden = !s.proof;
+  if (s.proof && !$("proof").src.endsWith("v=" + s.proof)) $("proof").src = "/label/proof.png?v=" + s.proof;
+  if (s.running) timer = setTimeout(poll, 1000);
+}
+poll();
+</script>
+</body></html>"""
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000)

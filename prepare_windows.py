@@ -1,4 +1,7 @@
-"""Approach 2, step 1: EuroSAT_MS -> one feature row per 16x16 px window (8 px step).
+"""Labelled window model, step 1: EuroSAT_MS -> one feature row per 16x16 px window (8 px step).
+
+train_labelled.py fits its scaler and k-means centroids on the training windows of this table and
+takes the train/test split of the images from it.
 
 Each window gets the same 73 features as a whole image (prepare.features_batch) and the label of
 the image it was cut from. Images are split into train/test exactly like the whole-image model;
