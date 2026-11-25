@@ -33,6 +33,7 @@ a "Highway" image is labelled Highway. Approach 2 fixes those labels before trai
 | `labeller.py` | Background labelling job used by the Label windows page: runs `train_labelled.py label` with the browser as labeller |
 | `trainer.py` | Background training/validation job used by the Train & validate page; saves models to `models/` |
 | `test_pipeline.py` | Quick end-to-end check of the whole-image steps on 30% of the data, plus the window features for approach 2; data and plots in `test_out/`, model as `models/test_model.joblib` |
+| `smoke_test.py` | Fast check without the dataset: starts the app, loads both models, classifies a fake image. Run by GitHub Actions (`.github/workflows/ci.yml`) on every pull request into `main` |
 | `pyproject.toml`, `uv.lock`, `.python-version` | Python version and exact package versions for uv |
 | `models/model.joblib`, `models/labelled_window_model.joblib` | The two trained models included in the repo (see below) |
 
