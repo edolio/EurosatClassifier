@@ -32,6 +32,7 @@ window inside a "Highway" image counts as an error. The real window accuracy is 
 | `app.py` | Local web app. **Classify**: upload an image, see the whole-image prediction and the window map. **Train & validate**: train or cross-validate new models from the browser |
 | `trainer.py` | Background training/validation job used by the Train & validate page; saves models to `models/` |
 | `test_pipeline.py` | Quick end-to-end check of all the steps on 30% of the data; data and plots in `test_out/`, models as `models/test_model.joblib` and `models/test_window_model.joblib` |
+| `smoke_test.py` | Fast check without the dataset: starts the app, loads both models, classifies a fake image. Run by GitHub Actions (`.github/workflows/ci.yml`) on every pull request into `main` |
 | `pyproject.toml`, `uv.lock`, `.python-version` | Python version and exact package versions for uv |
 | `models/model.joblib`, `models/window_model.joblib` | The two trained models included in the repo (see below) |
 
