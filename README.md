@@ -6,18 +6,18 @@ Classifies Sentinel-2 multispectral image patches from the
 Residential, River, SeaLake) with a scikit-learn Random Forest, and serves predictions
 through a small local web page.
 
-The project compares several classification approaches. Both use the same 73 features
-(mean, standard deviation and 10th/50th/90th percentiles of every band, plus mean and spread of
-four spectral indices: NDVI, NDWI, NDBI, NDMI), computed over different areas:
+The project has two classification approaches. Both use the same 73 features (mean, standard
+deviation and 10th/50th/90th percentiles of every band, plus mean and spread of four spectral
+indices: NDVI, NDWI, NDBI, NDMI), computed over different areas:
 
-| Approach | What is classified | Results on 30% of the data |
-|---|---|---|
-| 1. Whole image | each 64×64 px image | 89.1% test accuracy |
-| 2. Sliding windows | each 16×16 px window, every 8 px (7×7 = 49 windows per image) | 79.5% of windows correct; 91.1% of images correct when their windows' probabilities are averaged |
+| Approach | What is classified |
+|---|---|
+| 1. Whole image | each 64×64 px image: one class per tile (89.1% test accuracy on 30% of the data) |
+| 2. Labelled windows | each 16×16 px window, every 8 px (7×7 = 49 windows per image), with window labels cleaned by the forest and by you |
 
-Window labels are inherited from their image (EuroSAT has no per-pixel labels), so a field
-window inside a "Highway" image counts as an error. The real window accuracy is higher than
-79.5%.
+EuroSAT has no per-pixel labels: a window starts with its image's label, so a field window inside
+a "Highway" image is labelled Highway. Approach 2 fixes those labels before training (see
+*Labelled window model* below).
 
 ## Project files
 
@@ -26,34 +26,32 @@ window inside a "Highway" image counts as an error. The real window accuracy is 
 | `prepare.py` | Reads every image, computes the features, writes `features.csv` and prints a dataset description |
 | `grid_search.py` | 5-fold grid search of Random Forest hyperparameters, writes `cv_results.csv` |
 | `train_final.py` | Trains the final model with the best hyperparameters, prints the results, saves `final_results.png` (loss curve + confusion matrix) and `models/model.joblib` |
-| `prepare_windows.py` | Approach 2: cuts images into 16×16 px windows (8 px step), computes their features, writes `window_features.csv` |
-| `grid_search_windows.py` | Approach 2: 5-fold grid search grouped by image, writes `cv_results_windows.csv` |
-| `train_windows.py` | Approach 2: trains the final window model with the best hyperparameters, prints the results, saves `models/window_model.joblib` |
-| `grid_search_labelled.py` | Approach 3: 5-fold grid search grouped by image on the labelled windows, writes `cv_results_labelled.csv` |
-| `train_labelled.py` | Approach 3, two modes. `label`: builds the labelled window dataset (k-means distance features, forest relabelling, your labels for critical windows), writes `human_labels.csv` and `window_labels.csv`. `train`: trains the final labelled window model, prints per-window results, saves `labelled_results.png` and `models/labelled_window_model.joblib` |
-| `app.py` | Local web app. **Classify**: upload an image, see the whole-image prediction and the window map. **Train & validate**: train or cross-validate new models from the browser |
+| `prepare_windows.py` | Approach 2, step 1: cuts images into 16×16 px windows (8 px step), computes their features, writes `window_features.csv` (its training windows fit the k-means centroids) |
+| `grid_search_labelled.py` | Approach 2: 5-fold grid search grouped by image on the labelled windows, writes `cv_results_labelled.csv` |
+| `train_labelled.py` | Approach 2, two modes. `label`: builds the labelled window dataset (k-means distance features, forest relabelling, your labels for critical windows), writes `human_labels.csv` and `window_labels.csv`. `train`: trains the final labelled window model, prints per-window results, saves `labelled_results.png` and `models/labelled_window_model.joblib` |
+| `app.py` | Local web app. **Classify**: upload an image, see the whole-image prediction and the window map. **Train & validate**: train or cross-validate whole-image models from the browser. **Label windows**: label windows for approach 2 |
+| `labeller.py` | Background labelling job used by the Label windows page: runs `train_labelled.py label` with the browser as labeller |
 | `trainer.py` | Background training/validation job used by the Train & validate page; saves models to `models/` |
-| `test_pipeline.py` | Quick end-to-end check of all the steps on 30% of the data; data and plots in `test_out/`, models as `models/test_model.joblib` and `models/test_window_model.joblib` |
+| `test_pipeline.py` | Quick end-to-end check of the whole-image steps on 30% of the data, plus the window features for approach 2; data and plots in `test_out/`, model as `models/test_model.joblib` |
 | `pyproject.toml`, `uv.lock`, `.python-version` | Python version and exact package versions for uv |
-| `models/model.joblib`, `models/window_model.joblib`, `models/labelled_window_model.joblib` | The three trained models included in the repo (see below) |
+| `models/model.joblib`, `models/labelled_window_model.joblib` | The two trained models included in the repo (see below) |
 
 ## Included models
 
-The repo ships three trained models, so the web app works right after setup without any training:
+The repo ships two trained models, so the web app works right after setup without any training:
 
 | File | Approach | Trained on | Hyperparameters | Test results |
 |---|---|---|---|---|
 | `models/model.joblib` | Whole image | 30% of EuroSAT (6,480 train / 1,620 test images) | 200 trees, `max_features=sqrt` (best of a 50/100/200-tree grid search) | 89.1% accuracy, macro-F1 0.885 |
-| `models/window_model.joblib` | 16×16 px windows | Same 30% split (25,920 train / 79,380 test windows) | 200 trees, `max_features=sqrt`, `min_samples_leaf=2` (fixed, not grid-searched) | 79.5% of windows, 91.1% of images (averaged windows) |
 | `models/labelled_window_model.joblib` | 16×16 px windows + distances to 40 k-means centroids (web app default) | `train_labelled.py label`, 3 rounds on the same 30% split: 116,699 windows from 2,546 training images; 81 human labels, 448 forest relabels, 8,055 windows dropped | 200 trees, `max_features=sqrt`, `min_samples_leaf=2`, human labels weighted ×5 | 78.4% of 79,380 test windows, 89.2% of images (averaged windows) |
 
 They were trained with the package versions in `uv.lock`, which `uv sync` installs. A model file
 only loads with the scikit-learn version it was trained with.
 
-Running `train_final.py` or `train_windows.py` **replaces** these files with your own models, and
-`git` will then show them as changed. To keep the shipped ones, give your models other names, for
-example on the training page, or restore them with
-`git checkout -- models/model.joblib models/window_model.joblib`.
+Running `train_final.py` or `train_labelled.py train` **replaces** these files with your own models,
+and `git` will then show them as changed. To keep the shipped ones, give your models other names,
+for example on the training page, or restore them with
+`git checkout -- models/model.joblib models/labelled_window_model.joblib`.
 
 The dataset itself is **not** in the repo. You need it to train models, and you need at least
 some 13-band `.tif` images from it to try the classifier.
@@ -101,7 +99,8 @@ If something is missing, the scripts say what to do: no data → where to unzip 
 `features.csv` etc. → which step to run first. The web app starts with an empty `models/` folder,
 which is the case right after cloning, and asks you to train a model.
 
-**Quick check** that everything works, both approaches included (about 8 minutes, 30% of the data):
+**Quick check** that everything works (about 8 minutes, 30% of the data): the whole-image steps,
+plus `test_out/window_features.csv` for approach 2:
 ```
 uv run test_pipeline.py
 ```
@@ -115,32 +114,23 @@ uv run train_final.py
 `prepare.py` takes about 15 minutes for the full dataset (mostly disk reads), `grid_search.py`
 roughly 15–30 minutes on 8 cores, `train_final.py` a minute or two.
 
-**Window model (approach 2)**, same three steps:
+**Labelled window model (approach 2, human in the loop):**
 ```
 uv run prepare_windows.py
-uv run grid_search_windows.py
-uv run train_windows.py
-```
-- `prepare_windows.py` reads the images again (about 15 minutes for the full dataset). It
-  splits images into train and test exactly like approach 1, keeps 4 random windows per training
-  image and all 49 windows per test image. To use a share of the data:
-  `uv run prepare_windows.py data/EuroSAT_MS 0.3`.
-- Both prepare scripts read the default dataset folder (the one saved in the web app, else
-  `data/EuroSAT_MS`); give another folder as the first argument to override it for one run.
-- `grid_search_windows.py` searches `n_estimators`, `max_depth` and `min_samples_leaf`
-  (12 combinations) with 5-fold cross-validation on the training windows. Folds are grouped by
-  image, because the windows of one image overlap and would otherwise leak between folds.
-- `train_windows.py` trains the best model on all training windows and evaluates it on the
-  test windows, both per window and per image (averaging each image's windows).
-
-**Labelled window model (approach 3, human in the loop)**, same three steps after `prepare_windows.py`:
-```
 uv run train_labelled.py label all 1
 uv run grid_search_labelled.py
 uv run train_labelled.py train
 ```
+`prepare_windows.py` cuts the images into windows and computes their features (about 15 minutes
+for the full dataset). It splits images into train and test exactly like approach 1 and writes
+`window_features.csv`; `train_labelled.py` fits its scaler and k-means centroids on the training
+windows of that table. To use a share of the data: `uv run prepare_windows.py data/EuroSAT_MS 0.3`
+(the quick check writes the 30% version to `test_out/window_features.csv`). Both prepare scripts
+read the default dataset folder (the one saved in the web app, else `data/EuroSAT_MS`); give
+another folder as the first argument to override it for one run.
+
 `train_labelled.py label [images per class, or all] [rounds] [window_features.csv]` builds the dataset.
-`all 1` labels every training image in one round, the same images as the other two approaches;
+`all 1` labels every training image in one round, the same images as approach 1;
 smaller runs such as `100 3` are quicker for labelling sessions.
 EuroSAT labels whole images, so a window's label is only its image's label. This script builds a
 window dataset in rounds (default 3 rounds of 100 training images per class, all 49 windows each,
@@ -148,9 +138,12 @@ plus every image you already labelled a window of). It needs `window_features.cs
 `prepare_windows.py`: a scaler and k-means (40 centroids) are fitted once on its training windows,
 never on test images, and reused in every round and for later predictions.
 1. each window's 73 features are scaled and its distance to every saved centroid is added as a feature;
-2. the forest trains on the image labels (your labels override them and weigh 5x more) and scores
-   each window out-of-bag, only with trees that did not train on it. It relabels windows it is at
-   least 80% sure belong to another class, drops windows below 40%, and retrains.
+2. the forest trains on the image labels (your labels override them and weigh 5x more), using 8
+   random windows per image plus all your labels (neighbouring windows overlap, so the rest add
+   little but time). It scores every window with trees that did not train on it, relabels windows
+   it is at least 80% sure belong to another class, drops windows below 40%, and retrains.
+   Windows of River/SeaLake tiles that the forest sees as clearly land (water probability
+   below 20%: banks, shores) are relabelled to that land class.
    Relabels are recomputed from the image labels every round, so mistakes don't build up;
 3. it shows you about 30 critical windows, one per cluster: the window outlined on its image and
    enlarged. Type 0–9 in the terminal for the class, `m` for mixed / unsure (the window is dropped), `s` to skip,
@@ -167,11 +160,18 @@ compare with the image labels and with the automatic ones.
 - The labelled images are split 80/20 by image (stratified by class, seed 42), like the
   whole-image model. Test windows keep their cleaned labels: yours, the forest's relabels, or the
   image label; dropped windows are left out.
-- `grid_search_labelled.py` searches the same 12 combinations as the window model with 5-fold
+- `grid_search_labelled.py` searches `n_estimators`, `max_depth` and `min_samples_leaf` (12 combinations) with 5-fold
   cross-validation grouped by image and macro-F1, on 8 random windows per training image plus all
   your labelled ones (your labels weigh 5×). Writes `cv_results_labelled.csv`.
-- `train_labelled.py train` trains the best model on all training windows and reports everything per
-  window: loss curve and confusion matrix (`labelled_results.png`), test accuracy, macro-F1, log
+- `train_labelled.py train` trains the final model, three forests saved together:
+  - the **main forest** sees each window's own features plus a **water context**: the mean NDWI and
+    the share of water windows among the 24 windows around it (5×5). It decides land vs water and
+    the land class, so land on a riverbank is not pulled into River;
+  - for windows it calls water, a **River/SeaLake decider** chooses between the two from the class
+    probabilities of the same 24 neighbours (from a third, stage-1 forest): a river has banks
+    around it, a lake has more lake.
+
+  It reports everything per window: loss curve and confusion matrix (`labelled_results.png`), test accuracy, macro-F1, log
   loss, per-class results, and accuracy on the test windows you labelled. It saves
   `models/labelled_window_model.joblib` with the scaler and the 40 centroids. It does not predict
   whole tiles.
@@ -188,26 +188,34 @@ grid, proba = predict_windows(joblib.load("models/labelled_window_model.joblib")
 # grid: 7x7 array with the class of each window
 ```
 
+**Labelling in the browser:** the web app's **Label windows** page runs the same labelling loop
+as `train_labelled.py label`, with you answering in the browser instead of the terminal. Choose
+the images per class (`all` or a number), the rounds and the window features file, then press
+Start. Each question shows the tile with the window outlined and the window enlarged; answer with
+the class buttons or keys `0`–`9`, `m` (mixed / unsure), `s` (skip) or `q` (stop the round). Every
+answer goes straight to `human_labels.csv`. The log shows each message with the clock time and the
+time since the start. At the end the page shows the statistics as tables (totals, per class, a
+heat table of label changes, your labels) and the `window_labels.png` sample figure.
+
 **Web interface:**
 ```
 uv run app.py
 ```
 Then open <http://127.0.0.1:5000> and upload a `.tif` from `data/EuroSAT_MS`. The top of the
 page shows the whole-image prediction. Below it is the window map: each coloured square is one
-window's class (hover for its confidence), with window counts per class and the averaged
+window's class (hover for its confidence; a square split along the diagonal has two likely classes:
+top under 60% and runner-up at least 25%, both shown on hover), with window counts per class and the averaged
 prediction.
 
-The app loads `models/model.joblib` and, for windows, `models/labelled_window_model.joblib` (made by
-`train_labelled.py train`; until it exists, the included `models/window_model.joblib`) by default. If
-a model is missing, its section shows how to train one. To start with other models, give their
-names (files in `models/`), for example the quick-check models:
+The app loads `models/model.joblib` and, for windows, `models/labelled_window_model.joblib` by
+default. If a model is missing, its section shows how to build one. To start with other models,
+give their names (files in `models/`), for example the quick-check whole-image model:
 ```
-uv run app.py test_model test_window_model
+uv run app.py test_model
 ```
 Stop it with Ctrl+C.
 
-**Train & validate page** (<http://127.0.0.1:5000/train>): trains models from the browser.
-- **Approach:** whole image or windows.
+**Train & validate page** (<http://127.0.0.1:5000/train>): trains whole-image models from the browser.
 - **Mode:**
   - *Train only:* one value per hyperparameter.
   - *Validate only:* comma-separated values; every combination is cross-validated (up to 100).
@@ -219,14 +227,14 @@ Stop it with Ctrl+C.
   `min_samples_leaf`, plus the number of cross-validation folds.
 
 - **Model name** (when training): shown in the Classify page and used as the file name
-  `models/<name>.joblib`. It defaults to the approach plus date and time. An existing file is
+  `models/<name>.joblib`. It defaults to `image_model` plus date and time. An existing file is
   never overwritten: the page asks for another name.
 
 The page shows each stage's progress, a live log, the validation ranking and the trained model's
 test scores. **Use in classifier** loads the new model into the Classify page.
 
 **Choosing models on the Classify page:** the *Models* card at the top has one list for
-whole-image models and one for window models. It lists every model in `models/`. Picking one loads it immediately. The name of the model in use is shown in each
+whole-image models and one for labelled window models. It lists every model in `models/`. Picking one loads it immediately. The name of the model in use is shown in each
 section heading and parameter table. The choice lasts until the app restarts. Features
 from the last run are kept in memory, so a second run with the same data settings skips
 reading the images.

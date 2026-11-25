@@ -1,4 +1,4 @@
-"""Approach 3, step 2: grid-search the labelled window Random Forest on window_labels.csv.
+"""Approach 2 (labelled windows), step 2: grid-search the labelled window Random Forest on window_labels.csv.
 
 Input: window_labels.csv (train_labelled.py label: windows of training images, with final labels and
 features) and window_features.csv (its training windows give the saved scaler + k-means centroids).

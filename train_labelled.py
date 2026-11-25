@@ -1,4 +1,4 @@
-"""Approach 3: labelled window model, built and trained in two modes (one file).
+"""Approach 2: labelled window model, built and trained in two modes (one file).
 
 label: builds the labelled window dataset. A scaler and k-means (40 centroids) are fitted once on
 the training windows of window_features.csv (prepare_windows.py), so the same centroids serve every
@@ -7,8 +7,8 @@ windows each) plus every image a human already labelled a window of, then:
 1. scales the 73 features and adds each window's distance to every saved centroid;
 2. trains the forest on the image labels (human labels override them and weigh HUMAN_WEIGHT times
    more) and scores each window out-of-bag, i.e. only by trees that did not train on it. It
-   relabels windows it is confident belong to another class, drops windows it is unsure about,
-   and retrains. Relabels are recomputed every round from the image labels, never chained;
+   relabels windows it is confident belong to another class, relabels windows of River/SeaLake
+   tiles it sees as clearly land (banks, shores), drops windows it is unsure about, and retrains. Relabels are recomputed every round from the image labels, never chained;
 3. shows you the most critical windows (one per cluster): the window outlined on its image and
    enlarged. Type a class number in the terminal, m (mixed / unsure: the window is dropped), s (skip)
    or q (stop this round). Each answer is appended to human_labels.csv at once, so nothing is lost on quit.
@@ -16,8 +16,11 @@ windows each) plus every image a human already labelled a window of, then:
    final label, source and the 73 features of every window seen), window_labels.png (sample windows
    per label, framed by where the label came from) and printed statistics.
 
-train: after grid_search_labelled.py, trains the final forest with the best params, like
-train_final.py but every number is per window: loss curve as trees are added, confusion matrix,
+train: after grid_search_labelled.py, trains the final forest with the best params. Besides a window's
+own features it sees how much water surrounds it (mean NDWI and share of water windows among the 24
+windows around it, 5x5), so land on a bank is not pulled into River. For windows it calls water, a
+second forest decides River vs SeaLake from the class probabilities of those 24 neighbours (a river
+has banks around it). Like train_final.py but every number is per window: loss curve as trees are added, confusion matrix,
 accuracy, macro-F1, log loss and per-class results. Train and test windows come from an 80/20 split
 by image; test windows keep their cleaned labels and come from images the forest never trains on.
 Saves labelled_results.png and models/labelled_window_model.joblib (the web app's window model).
@@ -51,20 +54,29 @@ from prepare_windows import META, SIZE, STEP, windows
 ROUNDS, PER_CLASS, N_CLUSTERS = 3, 100, 40
 RELABEL_P, DROP_P = 0.8, 0.4  # forest confidence to relabel / below which a window is dropped
 HUMAN_WEIGHT, PER_ROUND = 5, 30  # human label weight in training; windows shown per round
+FIT_PER_IMAGE = 8  # windows per image the labelling forests learn from (all windows are scored)
 MIXED = "Mixed"
+WATER = ["River", "SeaLake"]
+BANK_WATER_P = 0.2  # below this water probability, a window in a River/SeaLake tile is relabelled as land
 HUMAN_CSV, OUT_CSV = PROJECT_DIR / "human_labels.csv", PROJECT_DIR / "window_labels.csv"
 FEATURES_CSV = PROJECT_DIR / "window_features.csv"  # from prepare_windows.py: k-means is fitted on its training windows
 KEY = ["file", "row", "col"]  # one window
 LOSS_SAMPLE = 20000  # windows per side used to draw the loss curve (scoring all at 25 sizes is slow)
 MAX_MB = 90  # saved model size limit, below GitHub's 100 MB per file
+NEIGHBOUR_R = 2  # water context from the 24 windows within 2 steps (5x5): 3x3 often holds only more water
 BYTES_PER_NODE = 16.5  # lzma-compressed size per tree node, measured on a saved model of 3 million nodes
 HUMAN_COLS = ["file", "image_label", "row", "col", "label", "round", "time"]
 
 
-def auto_labels(labels, is_human, pred, conf):
-    """Final label and its source for every window (step 2); human labels are never changed."""
+def auto_labels(labels, is_human, pred, conf, water_p):
+    """Final label and its source for every window (step 2); human labels are never changed.
+
+    water_p: forest probability of River + SeaLake. A window labelled River/SeaLake (its tile's label)
+    that the forest sees as clearly land is relabelled to that land class: banks and shores must not
+    teach "next to water = water"."""
     auto = ~is_human
-    relabel = auto & (conf >= RELABEL_P) & (pred != labels)
+    bank = auto & np.isin(labels, WATER) & (water_p < BANK_WATER_P) & ~np.isin(pred, WATER)
+    relabel = (auto & (conf >= RELABEL_P) & (pred != labels)) | bank
     drop = (auto & (conf < DROP_P)) | (labels == MIXED)
     final = np.where(relabel, pred, labels).astype(object)
     final[drop] = None
@@ -72,17 +84,21 @@ def auto_labels(labels, is_human, pred, conf):
     return final, source
 
 
-# Self-check: confident other class -> relabel; unsure -> drop; human labels (incl. Mixed) win.
-_f, _s = auto_labels(np.array(["River", "River", "River", "Forest", MIXED], object),
-                     np.array([0, 0, 0, 1, 1], bool), np.array(["Pasture"] * 5), np.array([.9, .3, .6, .9, .9]))
-assert _f.tolist() == ["Pasture", None, "River", "Forest", None], _f
-assert _s.tolist() == ["auto", "dropped", "image", "human", "dropped"], _s
+# Self-check: confident other class -> relabel; unsure -> drop; human labels (incl. Mixed) win;
+# a River window that is clearly land (water 0.1) -> land even at 0.6 confidence; with water 0.3 it stays.
+_f, _s = auto_labels(np.array(["River", "River", "River", "Forest", MIXED, "River", "River"], object),
+                     np.array([0, 0, 0, 1, 1, 0, 0], bool), np.array(["Pasture"] * 7),
+                     np.array([.9, .3, .6, .9, .9, .6, .6]), np.array([.05, .2, .3, .05, .05, .1, .3]))
+assert _f.tolist() == ["Pasture", None, "River", "Forest", None, "Pasture", "River"], _f
+assert _s.tolist() == ["auto", "dropped", "image", "human", "dropped", "auto", "image"], _s
 
 
 def load_windows(paths):
     """All 49 windows of each image, with their grid position."""
     parts = []
-    for path in paths:
+    for i, path in enumerate(paths, 1):
+        if i % 500 == 0 or i == len(paths):
+            print(f"Reading images and computing window features: {i}/{len(paths)}")
         img = tifffile.imread(path)
         if img.shape != (64, 64, len(BANDS)):
             print("skipped (unexpected shape):", path.name, img.shape)
@@ -152,23 +168,68 @@ def window_X(feats, scaler, km):
     return np.hstack([X, km.transform(X)])
 
 
+def neighbour_mean(P, rows=7, cols=7, r=NEIGHBOUR_R):
+    """P: (images * rows * cols, classes) in row-major grid order -> mean of each window's neighbours within r
+    windows (a (2r+1) x (2r+1) square without the window itself)."""
+    G = np.pad(P.reshape(-1, rows, cols, P.shape[-1]), ((0, 0), (r, r), (r, r), (0, 0)), constant_values=np.nan)
+    shifts = [G[:, r + dy:r + dy + rows, r + dx:r + dx + cols]
+              for dy in range(-r, r + 1) for dx in range(-r, r + 1) if dy or dx]
+    return np.nanmean(shifts, axis=0).reshape(P.shape)  # edge windows: only the neighbours inside the tile
+
+
+# Self-check: in a 2x2 grid every window's neighbours are the other three.
+assert np.allclose(neighbour_mean(np.array([[0.], [3.], [6.], [9.]]), 2, 2, r=1).ravel(), [6, 5, 4, 3])
+
+
+def water_context(F, rows=7, cols=7):
+    """Per window: mean NDWI and share of water windows (NDWI > 0) among its neighbours within NEIGHBOUR_R.
+    A water signal, not class probabilities: "next to water" says nothing about being River."""
+    ndwi = F["NDWI_mean"].to_numpy()[:, None]
+    return np.hstack([neighbour_mean(ndwi, rows, cols), neighbour_mean((ndwi > 0).astype(float), rows, cols)])
+
+
+def water_gate(P, Pd, classes, d_classes):
+    """Where P's top class is River or SeaLake, split its water probability between the two as the
+    decider (Pd) says. Land windows are left exactly as they are."""
+    ri, si = list(classes).index("River"), list(classes).index("SeaLake")
+    m = np.isin(np.asarray(classes)[P.argmax(1)], WATER)
+    water = P[m, ri] + P[m, si]
+    P = P.copy()
+    P[m, ri], P[m, si] = water * Pd[m, list(d_classes).index("River")], water * Pd[m, list(d_classes).index("SeaLake")]
+    return P
+
+
+# Self-check: a water window follows the decider; a land window (top class Pasture) is untouched.
+_P = water_gate(np.array([[.6, .3, .1], [.2, .2, .6]]), np.array([[.1, .9], [.9, .1]]),
+                ["River", "SeaLake", "Pasture"], ["River", "SeaLake"])
+assert np.allclose(_P, [[.09, .81, .1], [.2, .2, .6]]), _P
+
+
 def predict_windows(bundle, img):
     """img (64, 64, 13) -> (7, 7) predicted class and (7, 7, n_classes) probabilities, one per window."""
     w = windows(img, bundle["size"], bundle["step"])
     rows, cols = w.shape[:2]
-    P = bundle["model"].predict_proba(window_X(features_batch(w.reshape(rows * cols, -1, img.shape[-1])),
-                                               bundle["scaler"], bundle["kmeans"]))
+    F = features_batch(w.reshape(rows * cols, -1, img.shape[-1]))
+    X = window_X(F, bundle["scaler"], bundle["kmeans"])
+    X1 = X
+    if bundle.get("water_context"):  # + how much water surrounds each window
+        X = np.hstack([X, water_context(F, rows, cols)])
+    P = bundle["model"].predict_proba(X)
+    if "decider" in bundle:  # River vs SeaLake from the neighbours' class probabilities
+        X2 = np.hstack([X1, neighbour_mean(bundle["stage1"].predict_proba(X1), rows, cols)])
+        P = water_gate(P, bundle["decider"].predict_proba(X2), bundle["model"].classes_, bundle["decider"].classes_)
     return bundle["model"].classes_[P.argmax(1)].reshape(rows, cols), P.reshape(rows, cols, -1)
 
 
-def make_forest(oob=False):
-    return RandomForestClassifier(n_estimators=200, min_samples_leaf=2, max_features="sqrt", oob_score=oob,
-                                  n_jobs=-1, random_state=42)
+def make_forest(oob=False, **params):
+    return RandomForestClassifier(**{"n_estimators": 200, "min_samples_leaf": 2, **params}, max_features="sqrt",
+                                  oob_score=oob, n_jobs=-1, random_state=42)
 
 
-def forest_proba(X, y, weight, rows):
-    """Fit on the windows in rows; class probabilities for every window, out-of-bag for those."""
-    rf = make_forest(oob=True)
+def forest_proba(X, y, weight, rows, **params):
+    """Fit a forest on the windows in rows; the forest and class probabilities for every window,
+    out-of-bag for those."""
+    rf = make_forest(oob=True, **params)
     with warnings.catch_warnings():  # "some inputs do not have OOB scores": handled below
         warnings.filterwarnings("ignore", "Some inputs do not have OOB scores")
         rf.fit(X[rows], y[rows], sample_weight=weight[rows])
@@ -176,7 +237,7 @@ def forest_proba(X, y, weight, rows):
     oob = rf.oob_decision_function_  # each training window scored only by trees that never saw it
     seen = oob.sum(1) > 0  # sklearn gives all zeros to a window no tree left out: keep predict_proba
     P[np.flatnonzero(rows)[seen]] = oob[seen]
-    return rf.classes_, P
+    return rf, P
 
 
 def run_round(pool, human_csv, rnd, classes, ask, scaler, km):
@@ -192,10 +253,19 @@ def run_round(pool, human_csv, rnd, classes, ask, scaler, km):
     labels = np.where(is_human, h, pool.image_label).astype(object)
     weight = np.where(is_human, HUMAN_WEIGHT, 1)
     use = labels != MIXED
-    classes_, P = forest_proba(X, labels, weight, use)
-    final, source = auto_labels(labels, is_human, classes_[P.argmax(1)], P.max(1))
+    # The forests learn from FIT_PER_IMAGE random windows per image (+ all yours) but score every window:
+    # neighbouring windows overlap by half, so the rest add little but time.
+    rng = np.random.default_rng(rnd)
+    rank = pool.assign(k=rng.random(len(pool))).sort_values("k").groupby("file").cumcount().sort_index()
+    fit = (rank < FIT_PER_IMAGE).to_numpy() | is_human
+    print(f"Fitting forest 1/2 (relabel and drop) on {(use & fit).sum()} windows, scoring all {len(pool)}")
+    rf, P = forest_proba(X, labels, weight, use & fit)
+    classes_ = rf.classes_
+    final, source = auto_labels(labels, is_human, classes_[P.argmax(1)], P.max(1), P[:, np.isin(classes_, WATER)].sum(1))
     keep = source != "dropped"
-    classes_, P = forest_proba(X, final, weight, keep)
+    print(f"Fitting forest 2/2 (choose the windows to ask about) on {(keep & fit).sum()} windows")
+    rf, P = forest_proba(X, final, weight, keep & fit)
+    classes_ = rf.classes_
     top2 = np.sort(P, 1)[:, -2:]
     guess, conf, margin = classes_[P.argmax(1)], top2[:, 1], top2[:, 1] - top2[:, 0]
 
@@ -209,7 +279,7 @@ def run_round(pool, human_csv, rnd, classes, ask, scaler, km):
     # 3. Critical windows: relabelled first, then smallest top-2 margin; one per cluster.
     cand = pd.DataFrame({"cluster": cluster, "score": margin - (source == "auto")})[~is_human]
     picked = cand.sort_values("score").groupby("cluster").head(1).head(PER_ROUND).index
-    print(f"Asking you about {len(picked)} windows. Type the answer here and press Enter:\n  "
+    print(f"Asking you about {len(picked)} windows (in the terminal: type the key, then Enter):\n  "
           + "  ".join(f"{i}={c}" for i, c in enumerate(classes)) + "\n  m=Mixed/unsure  s=skip  q=stop this round")
     agree, answered = 0, 0
     for n, i in enumerate(picked, 1):
@@ -295,10 +365,17 @@ def print_stats(out, human, checks):
     print("\nPer class (moved = label changed by the forest or by you):\n" + t.to_string())
 
     changed = used[used.label != used.image_label]
-    if len(changed):
-        print("\nLabel changes (rows: image class, columns: new label):\n"
-              + pd.crosstab(changed.image_label, changed.label).to_string())
+    changes = pd.crosstab(changed.image_label, changed.label) if len(changed) else None
+    if changes is not None:
+        print("\nLabel changes (rows: image class, columns: new label):\n" + changes.to_string())
 
+    def table(df):  # JSON-ready table for the web app (plain ints/floats, not numpy types)
+        num = lambda v: int(v) if float(v).is_integer() else float(v)
+        return {"columns": [str(c) for c in df.columns],
+                "rows": [[str(i), *map(num, r)] for i, r in zip(df.index, df.to_numpy())]}
+    stats = {"seen": len(out), "images": int(out.file.nunique()), "used": len(used), "dropped": len(out) - len(used),
+             "sources": {k: int(v) for k, v in src.items()}, "per_class": table(t),
+             "changes": table(changes) if changes is not None else None, "human": None, "rounds": []}
     if len(human):
         mixed = (human.label == MIXED).sum()
         named = human[human.label != MIXED]
@@ -308,13 +385,19 @@ def print_stats(out, human, checks):
         per = (named.label == named.image_label).groupby(named.image_label).agg(["mean", "size"])
         print("Agreement with the image label, per image class: "
               + ", ".join(f"{k} {m:.0%} of {n}" for k, m, n in per.itertuples()))
+        stats["human"] = {"total": len(human), "mixed": int(mixed), "agree_image": None if np.isnan(same) else float(same),
+                          "per_class": [[k, float(m), int(n)] for k, m, n in per.itertuples()],
+                          "labels": {k: int(v) for k, v in human.label.value_counts().items()}}
     for rnd, (agree, answered) in enumerate(checks, 1):
         if answered:
             print(f"Round {rnd}: automatic label matched yours on {agree}/{answered} ({agree / answered:.0%})")
+            stats["rounds"].append([rnd, int(agree), int(answered)])
+    return stats
 
 
 def label(per_class=PER_CLASS, rounds=ROUNDS, features_csv=FEATURES_CSV, ask=human_ask, human_csv=HUMAN_CSV,
-         out_csv=OUT_CSV, root=None):
+         out_csv=OUT_CSV, root=None, on_stats=None):
+    """on_stats(stats), if given, receives the final statistics as soon as they exist (the web app shows them)."""
     per_class = 10**9 if str(per_class) == "all" else int(per_class)  # "all": every training image
     rounds = int(rounds)
     root = find_root(root or data_root())
@@ -332,26 +415,29 @@ def label(per_class=PER_CLASS, rounds=ROUNDS, features_csv=FEATURES_CSV, ask=hum
         results.append(out)
         checks.append(check)
     out = pd.concat(results, ignore_index=True).drop_duplicates(KEY, keep="last")
+    stats = print_stats(out, read_human(human_csv), checks)
+    if on_stats:
+        on_stats(stats)
+    print(f"\nSaving the dataset ({len(out)} windows with features; about a minute per 100,000 windows)...")
     out.to_csv(out_csv, index=False, float_format="%.6g")  # with features: the dataset 'train' reads
-    print(f"\nSaved {out_csv}: {len(out)} windows\n" + out.source.value_counts().to_string())
+    print(f"Saved {out_csv}")
     print(f"Human labels: {len(read_human(human_csv))} in {human_csv}")
-    print_stats(out, read_human(human_csv), checks)
-
     save_proof(out, root, Path(out_csv).with_suffix(".png"))
     return out
 
 
-def load_labelled(labels_csv=OUT_CSV, features_csv=FEATURES_CSV, test_size=0.2):
-    """Windows not dropped (with a train/test split column), forest input, labels, weights, scaler + k-means."""
-    df = pd.read_csv(labels_csv)
+def load_labelled(labels_csv=OUT_CSV, features_csv=FEATURES_CSV, test_size=0.2, with_dropped=False):
+    """Windows (not dropped, or all with with_dropped) with a train/test split column, forest input,
+    labels, weights, scaler + k-means. Rows are sorted by image, row, col."""
+    df = pd.read_csv(labels_csv).sort_values(KEY).reset_index(drop=True)
     scaler, km, _ = fit_kmeans(features_csv)  # same seed and data as 'label': same centroids
     if not set(scaler.feature_names_in_) <= set(df.columns):
         raise FileNotFoundError(f"{labels_csv} has no window features: rerun train_labelled.py label")
-    used = df[df.source != "dropped"].reset_index(drop=True)
     # 80/20 split by image, stratified by image class, like the whole-image model: test windows keep
     # their cleaned labels and come from images the grid search and final forest never train on.
-    files = used.groupby("file").image_label.first()
+    files = df[df.source != "dropped"].groupby("file").image_label.first()
     _, test_files = train_test_split(files.index, test_size=test_size, stratify=files, random_state=42)
+    used = (df if with_dropped else df[df.source != "dropped"]).reset_index(drop=True)
     used["split"] = np.where(used.file.isin(test_files), "test", "train")
     weight = np.where(used.source == "human", HUMAN_WEIGHT, 1)
     return used, window_X(used, scaler, km), used.label.to_numpy(), weight, scaler, km
@@ -363,9 +449,12 @@ def train(labels_csv=OUT_CSV, cv_csv=PROJECT_DIR / "cv_results_labelled.csv", fe
     out_model = model_file(out_model)
     cv = pd.read_csv(cv_csv)
     best = ast.literal_eval(cv.loc[cv.rank_test_score.idxmin(), "params"])  # rank 1
-    used, X, y, w, scaler, km = load_labelled(labels_csv, features_csv)
-    tr, te = (used.split == "train").to_numpy(), (used.split == "test").to_numpy()
-    X_train, y_train, X_test, y_test = X[tr], y[tr], X[te], y[te]
+    # All windows (dropped ones too) so every window has its full neighbourhood; only used ones train or score.
+    used, X1, y, w, scaler, km = load_labelled(labels_csv, features_csv, with_dropped=True)
+    assert (used.groupby("file").size() == 49).all(), "every image needs all 49 windows"
+    keep = (used.source != "dropped").to_numpy()
+    tr, te = keep & (used.split == "train").to_numpy(), keep & (used.split == "test").to_numpy()
+    y_train, y_test = y[tr], y[te]
 
     # A forest has no epochs: "training" = adding trees, so track loss as the forest grows.
     rng = np.random.default_rng(0)
@@ -373,7 +462,18 @@ def train(labels_csv=OUT_CSV, cv_csv=PROJECT_DIR / "cv_results_labelled.csv", fe
     lte = rng.choice(len(y_test), min(LOSS_SAMPLE, len(y_test)), replace=False)
     n_total = best.pop("n_estimators")
     steps = sorted(set(range(10, n_total, max(n_total // 25, 1))) | {n_total})
+    # Own features + water around the window (24 neighbours, 5x5): water in a river tile has banks nearby.
+    X = np.hstack([X1, water_context(used)])
+    X_train, X_test = X[tr], X[te]
+    water_tr = tr & np.isin(y, WATER)
     while True:  # refit with bigger leaves until the saved model fits under MAX_MB (GitHub's limit is 100 MB)
+        # River vs SeaLake decider: stage 1 (own features; out-of-bag on training windows, so the decider
+        # doesn't learn from over-confident scores), then a forest on water windows that also sees the
+        # 24 neighbours' stage-1 probabilities (a river has banks around it, a lake has more lake).
+        s1, P1 = forest_proba(X1, y, w, tr, n_estimators=n_total, **best)
+        X2 = np.hstack([X1, neighbour_mean(P1)])
+        dec = make_forest(n_estimators=n_total, **best).fit(X2[water_tr], y[water_tr], sample_weight=w[water_tr])
+        # Main model: own features + water context; decides land vs water and the land class.
         rf = RandomForestClassifier(max_features="sqrt", warm_start=True, n_jobs=-1, random_state=42, **best)
         train_loss, test_loss = [], []
         for n in steps:
@@ -383,14 +483,14 @@ def train(labels_csv=OUT_CSV, cv_csv=PROJECT_DIR / "cv_results_labelled.csv", fe
             print(f"\r  trees {n:>4}/{n_total}  train loss {train_loss[-1]:.4f}  test loss {test_loss[-1]:.4f}",
                   end="", flush=True)
         print()
-        est_mb = sum(t.tree_.node_count for t in rf.estimators_) * BYTES_PER_NODE / 1e6
+        est_mb = sum(t.tree_.node_count for f in (rf, s1, dec) for t in f.estimators_) * BYTES_PER_NODE / 1e6
         if est_mb <= MAX_MB:
             break
         best["min_samples_leaf"] = 2 * rf.min_samples_leaf  # fewer, larger leaves: about half the nodes
         print(f"  Model would be ~{est_mb:.0f} MB (limit {MAX_MB} MB): refitting with "
               f"min_samples_leaf={best['min_samples_leaf']}")
 
-    P = rf.predict_proba(X_test)
+    P = water_gate(rf.predict_proba(X_test), dec.predict_proba(X2[te]), rf.classes_, dec.classes_)
     pred = rf.classes_[P.argmax(1)]
     src_tr, src_te = used.source[tr].value_counts(), used.source[te].value_counts()
     metrics = {"cv_macro_f1": cv.mean_test_score.max(),
@@ -418,22 +518,21 @@ def train(labels_csv=OUT_CSV, cv_csv=PROJECT_DIR / "cv_results_labelled.csv", fe
     print(f"{line}\n\nPer-class results (test windows):\n")
     print(classification_report(y_test, pred, digits=3))
 
-    bundle = {"model": rf, "name": Path(out_model).stem, "scaler": scaler, "kmeans": km,
+    bundle = {"model": rf, "water_context": True, "stage1": s1, "decider": dec, "name": Path(out_model).stem, "scaler": scaler, "kmeans": km,
               "features": list(scaler.feature_names_in_), "size": SIZE, "step": STEP, "per_image": "all",
               "params": {**params, "k-means centroids": km.n_clusters,
+                         "context": "water share + mean NDWI of the 24 neighbouring windows",
+                         "River vs SeaLake": "decided from the 24 neighbours' class probabilities",
                          "human labels (weight)": f"{src_tr.get('human', 0)} (×{HUMAN_WEIGHT})",
                          "relabelled by the forest": int(src_tr.get("auto", 0))},
               "metrics": metrics, "trained": time.strftime("%Y-%m-%d %H:%M")}
 
-    # Self-check: from pixels, the saved bundle predicts a training image exactly as in training.
-    for f in used[tr].file.unique()[:50]:
-        rows = used.index[used.file == f]
-        if len(rows) == 49:  # an image with no dropped window
-            img = used.loc[rows[0]]
-            grid, _ = predict_windows(bundle, tifffile.imread(find_root(data_root()) / img.image_label / f))
-            order = used.loc[rows].sort_values(["row", "col"]).index
-            assert (grid.ravel() == rf.predict(X[order])).all(), "prediction path differs from training"
-            break
+    # Self-check: from pixels, the saved bundle predicts a test image exactly as evaluated here.
+    f = used.file[te].iloc[0]
+    rows = np.flatnonzero((used.file == f).to_numpy())  # its 49 windows, sorted by row and col
+    grid, _ = predict_windows(bundle, tifffile.imread(find_root(data_root()) / used.image_label[rows[0]] / f))
+    Pg = water_gate(rf.predict_proba(X[rows]), dec.predict_proba(X2[rows]), rf.classes_, dec.classes_)
+    assert (grid.ravel() == rf.classes_[Pg.argmax(1)]).all(), "prediction path differs from evaluation"
 
     joblib.dump(bundle, out_model, compress=("lzma", 3))  # ~35% smaller than zlib, loads as fast
     size_mb = out_model.stat().st_size / 1e6
