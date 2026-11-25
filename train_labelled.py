@@ -12,9 +12,9 @@ windows each) plus every image a human already labelled a window of, then:
 3. shows you the most critical windows (one per cluster): the window outlined on its image and
    enlarged. Type a class number in the terminal, m (mixed / unsure: the window is dropped), s (skip)
    or q (stop this round). Each answer is appended to human_labels.csv at once, so nothing is lost on quit.
-   Outputs: human_labels.csv (your labels, read again on every run), window_labels.csv.gz (the dataset:
+   Outputs in ProcessedData4Train/: human_labels.csv (your labels, read again on every run), window_labels.csv.gz (the dataset:
    final label and source of every window seen, ~1.4 MB), window_labels_features.csv (the 73 features
-   of the same windows, large and not in git), window_labels.png (sample windows
+   of the same windows, large and not in git), and, in the project folder, window_labels.png (sample windows
    per label, framed by where the label came from) and printed statistics.
 
 train: after grid_search_labelled.py, trains the final forest with the best params. Besides a window's
@@ -49,7 +49,7 @@ from sklearn.metrics import (ConfusionMatrixDisplay, accuracy_score, classificat
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-from prepare import BANDS, PROJECT_DIR, data_root, features_batch, find_root, list_images, model_file
+from prepare import BANDS, PROCESSED_DIR, PROJECT_DIR, data_root, features_batch, find_root, list_images, model_file
 from prepare_windows import META, SIZE, STEP, windows
 
 ROUNDS, PER_CLASS, N_CLUSTERS = 3, 100, 40
@@ -59,8 +59,8 @@ FIT_PER_IMAGE = 8  # windows per image the labelling forests learn from (all win
 MIXED = "Mixed"
 WATER = ["River", "SeaLake"]
 BANK_WATER_P = 0.2  # below this water probability, a window in a River/SeaLake tile is relabelled as land
-HUMAN_CSV = PROJECT_DIR / "human_labels.csv"
-OUT_CSV = PROJECT_DIR / "window_labels.csv.gz"  # labels only, gzipped: ~1.4 MB, small enough for git
+HUMAN_CSV = PROCESSED_DIR / "human_labels.csv"
+OUT_CSV = PROCESSED_DIR / "window_labels.csv.gz"  # labels only, gzipped: ~1.4 MB, small enough for git
 PROOF_PNG = PROJECT_DIR / "window_labels.png"
 LABEL_COLS = ["file", "row", "col", "image_label", "label", "source", "confidence", "round"]
 FEATURES_CSV = PROJECT_DIR / "window_features.csv"  # from prepare_windows.py: k-means is fitted on its training windows
@@ -408,6 +408,8 @@ def label(per_class=PER_CLASS, rounds=ROUNDS, features_csv=FEATURES_CSV, ask=hum
          out_csv=OUT_CSV, root=None, on_stats=None):
     """on_stats(stats), if given, receives the final statistics as soon as they exist (the web app shows them)."""
     per_class = 10**9 if str(per_class) == "all" else int(per_class)  # "all": every training image
+    for f in (human_csv, out_csv):
+        Path(f).parent.mkdir(parents=True, exist_ok=True)
     rounds = int(rounds)
     root = find_root(root or data_root())
     scaler, km, train_files = fit_kmeans(features_csv)

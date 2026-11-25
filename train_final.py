@@ -18,10 +18,10 @@ from sklearn.metrics import (ConfusionMatrixDisplay, accuracy_score, classificat
                              f1_score, log_loss)
 
 from grid_search import split
-from prepare import PROJECT_DIR, model_file
+from prepare import PROCESSED_DIR, PROJECT_DIR, model_file
 
 
-def main(features_csv=PROJECT_DIR / "features.csv", cv_csv=PROJECT_DIR / "cv_results.csv",
+def main(features_csv=PROCESSED_DIR / "features.csv", cv_csv=PROJECT_DIR / "cv_results.csv",
          out_png=PROJECT_DIR / "final_results.png",
          out_model="model.joblib"):
     out_model = model_file(out_model)

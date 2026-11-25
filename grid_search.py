@@ -9,7 +9,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
 
-from prepare import PROJECT_DIR
+from prepare import PROCESSED_DIR, PROJECT_DIR
 
 PARAM_GRID = {
     "n_estimators": [200, 500],
@@ -26,7 +26,7 @@ def split(df, test_size=0.2):
     return train_test_split(X, y, test_size=test_size, stratify=y, random_state=42)
 
 
-def run(features_csv=PROJECT_DIR / "features.csv", param_grid=PARAM_GRID, out_csv=PROJECT_DIR / "cv_results.csv"):
+def run(features_csv=PROCESSED_DIR / "features.csv", param_grid=PARAM_GRID, out_csv=PROJECT_DIR / "cv_results.csv"):
     X_train, X_test, y_train, y_test = split(pd.read_csv(features_csv))
     search = GridSearchCV(
         RandomForestClassifier(max_features="sqrt", random_state=42),

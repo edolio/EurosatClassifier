@@ -11,6 +11,7 @@ then open http://127.0.0.1:5000
 """
 import base64
 import io
+import os
 import re
 import sys
 import time
@@ -910,7 +911,7 @@ kbd{font:600 12px/1 ui-monospace,Consolas,monospace;color:var(--collar);border:1
 <div class="form">
 <h1>Label windows</h1>
 <p class="lede">The labelling loop of <code>train_labelled.py label</code>, answered here. The forest relabels and drops windows
-on its own, then asks you about the windows it finds hardest. Every answer is saved at once to <code>human_labels.csv</code>.</p>
+on its own, then asks you about the windows it finds hardest. Every answer is saved at once to <code>ProcessedData4Train/human_labels.csv</code>.</p>
 
 <form id="f" novalidate>
 <fieldset><legend class="caps">Run</legend>
@@ -1059,7 +1060,7 @@ async function poll() {
   const log = s.log || [];
   if (s.started) {
     $("stage").textContent = s.error ? s.error : q ? "Waiting for your answer." : s.running ? (log[log.length - 1] || "Starting") :
-      `Finished at ${s.finished}. Dataset saved to window_labels.csv.gz (labels) and window_labels_features.csv.`;
+      `Finished at ${s.finished}. Dataset saved to ProcessedData4Train/window_labels.csv.gz (labels) and window_labels_features.csv.`;
     $("log").hidden = !log.length; $("log").textContent = log.join("\\n"); $("log").scrollTop = 1e9;
     $("elapsed").textContent = s.elapsed ? `Started at ${s.started} · ${s.running ? "elapsed" : "took"} ${s.elapsed}` : "";
   }
@@ -1076,4 +1077,5 @@ poll();
 </body></html>"""
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000)
+    # HOST=0.0.0.0 in the Docker image, so the published port reaches the app; locally only this computer
+    app.run(host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "5000")))
